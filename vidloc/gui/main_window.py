@@ -192,7 +192,8 @@ class MainWindow(QMainWindow):
         hs_wrap.setLayout(hs_row)
 
         self.cmb_inpaint = _combo([
-            ("Якісно (нейро LaMa) — повільно", "quality"),
+            ("Збалансовано (нейро ÷2) — швидше", "balanced"),
+            ("Найкраще (нейро, повний розмір)", "best"),
             ("Швидко (delogo) — грубо", "fast"),
         ])
 

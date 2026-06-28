@@ -154,8 +154,9 @@ class OutputConfig:
 
 
 class InpaintQuality(str, Enum):
-    FAST = "fast"        # ffmpeg delogo — instant, rough
-    QUALITY = "quality"  # neural LaMa (IOPaint) — slow, clean
+    FAST = "fast"          # ffmpeg delogo — instant, rough
+    BALANCED = "balanced"  # neural LaMa at half-res — fast & clean (default)
+    BEST = "best"          # neural LaMa at full res — best, slowest
 
 
 @dataclass
@@ -166,7 +167,7 @@ class RemovalConfig:
     remove_hardsubs: bool = False
     # normalized rectangle for the burned-in subtitle band; None = auto-detect
     hardsub_region: Optional[tuple] = None
-    quality: InpaintQuality = InpaintQuality.QUALITY
+    quality: InpaintQuality = InpaintQuality.BALANCED
 
 
 @dataclass
