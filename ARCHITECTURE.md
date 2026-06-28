@@ -1,118 +1,121 @@
-# Архитектура Vidloc
+# Vidloc architecture
 
-Технический разбор: как устроен пайплайн, какие модели используются и почему приняты
-ключевые инженерные решения.
+**English** · [Русский](ARCHITECTURE.ru.md)
+
+A technical walkthrough: how the pipeline works, which models are used, and the reasoning
+behind the key engineering decisions.
 
 ## TL;DR
 
-- **Полностью локально, офлайн.** Весь AI-инференс выполняется на машине пользователя.
-  Сеть нужна только для (1) разовой загрузки моделей с Hugging Face Hub и (2) опционального
-  скачивания видео по ссылке (`yt-dlp`). **Облачных inference-API нет, данные никуда не уходят.**
-- **Ускорение через Apple Metal.** ASR и переводящая LLM — на **MLX**; NLLB — на **PyTorch MPS**;
-  нейро-inpainting (LaMa) — на **MPS**; кодирование видео — опционально на **VideoToolbox**.
-- **Движок отделён от интерфейса.** Ядро (`PipelineRunner`) не знает про GUI: общается с
-  `Reporter` (прогресс/отмена), поэтому GUI и CLI используют один и тот же конвейер.
+- **Fully local, offline.** All AI inference runs on the user's machine. The network is only used
+  for (1) a one-time model download from the Hugging Face Hub and (2) optional video download by
+  URL (`yt-dlp`). **There are no cloud inference APIs — no data leaves the device.**
+- **Apple Metal acceleration.** ASR and the translation LLM run on **MLX**; NLLB runs on
+  **PyTorch MPS**; neural inpainting (LaMa) runs on **MPS**; video encoding optionally uses
+  **VideoToolbox**.
+- **Engine decoupled from the UI.** The core (`PipelineRunner`) knows nothing about the GUI — it
+  talks to a `Reporter` (progress/cancel), so the GUI and the CLI share the same pipeline.
 
-## Пайплайн
+## Pipeline
 
 ```mermaid
 flowchart TD
-    IN["Вход: локальный файл или URL (yt-dlp)"] --> PROBE["ffprobe: разрешение, fps, наличие аудио"]
-    PROBE --> AUD["Извлечение аудио 16 кГц (ffmpeg)"]
+    IN["Input: local file or URL (yt-dlp)"] --> PROBE["ffprobe: resolution, fps, audio?"]
+    PROBE --> AUD["Extract 16 kHz audio (ffmpeg)"]
     AUD --> ASR["ASR — mlx-whisper (Metal / MLX)"]
-    ASR --> MT{"Перевод на украинский"}
-    MT -->|"NATURAL (по умолчанию)"| LLM["Локальная LLM: Aya-expanse-8B-4bit (MLX) + контекст видео"]
+    ASR --> MT{"Translate to Ukrainian"}
+    MT -->|"NATURAL (default)"| LLM["Local LLM: Aya-expanse-8B-4bit (MLX) + video context"]
     MT -->|"FAST / BEST"| NLLB["NLLB-200 (PyTorch MPS)"]
-    LLM --> SEG["Переведённые сегменты"]
+    LLM --> SEG["Translated segments"]
     NLLB --> SEG
 
-    SEG --> SUBS["Субтитры: SRT (soft) или styled ASS (burn)"]
-    SEG --> DUB["Озвучка: UA TTS — uktts / piper / coqui"]
-    IN --> INP["Удаление вотермарок: LaMa / IOPaint (MPS) или ffmpeg delogo"]
+    SEG --> SUBS["Subtitles: SRT (soft) or styled ASS (burn)"]
+    SEG --> DUB["Dubbing: UA TTS — uktts / piper / coqui"]
+    IN --> INP["Watermark removal: LaMa / IOPaint (MPS) or ffmpeg delogo"]
 
-    SUBS --> REND["Финальный рендер — ffmpeg: кодек/контейнер/CRF, VideoToolbox"]
+    SUBS --> REND["Final render — ffmpeg: codec/container/CRF, VideoToolbox"]
     DUB --> REND
     INP --> REND
-    REND --> OUT["Готовое видео *_uk"]
+    REND --> OUT["Final video *_uk"]
 ```
 
-Порядок задаётся в `pipeline/runner.py`. Стадии включаются по `JobConfig` (что именно
-нужно сделать), а **inpaint (GPU) и озвучка (CPU) выполняются параллельно** в одной стадии
-`process` — пока видеокарта чистит кадры, процессор синтезирует речь.
+Stage order lives in `pipeline/runner.py`. Stages are switched on by `JobConfig` (what actually
+needs doing), and **inpainting (GPU) and dubbing (CPU) run in parallel** in a single `process`
+stage — while the GPU cleans frames, the CPU synthesizes speech.
 
-## Стадии и модели
+## Stages and models
 
-| Стадия | Что делает | Модель / движок | Ускорение |
+| Stage | What it does | Model / engine | Acceleration |
 |---|---|---|---|
-| **ASR** | речь → текст с таймкодами | `whisper-large-v3-mlx` (BEST, по умолч.), `whisper-large-v3-turbo` (BALANCED), `whisper-medium-mlx` (FAST) | Metal (MLX) |
-| **Перевод · NATURAL** | идиоматичный, со сленгом, по смыслу | `mlx-community/aya-expanse-8b-4bit` (Cohere Aya) | Metal (MLX) |
-| **Перевод · FAST/BEST** | дословный, быстрый (фолбэк) | `facebook/nllb-200-distilled-600M` / `-1.3B` | Metal (PyTorch MPS) |
-| **Озвучка** | текст → украинская речь | ukrainian-tts (5 голосов), Piper ONNX (3 голоса), Coqui `uk/mai/vits` (фолбэк) | CPU (subprocess) |
-| **Удаление вотермарок** | inpainting региона | **LaMa** через IOPaint (QUALITY), `ffmpeg delogo` (FAST) | Metal (MPS) / ffmpeg |
-| **Рендер** | сборка итогового видео | ffmpeg: H.264 / H.265, mp4 / mkv / mov / webm | VideoToolbox (опц.) |
+| **ASR** | speech → timestamped text | `whisper-large-v3-mlx` (BEST, default), `whisper-large-v3-turbo` (BALANCED), `whisper-medium-mlx` (FAST) | Metal (MLX) |
+| **Translate · NATURAL** | idiomatic, slang-aware, by meaning | `mlx-community/aya-expanse-8b-4bit` (Cohere Aya) | Metal (MLX) |
+| **Translate · FAST/BEST** | literal, fast (fallback) | `facebook/nllb-200-distilled-600M` / `-1.3B` | Metal (PyTorch MPS) |
+| **Dubbing** | text → Ukrainian speech | ukrainian-tts (5 voices), Piper ONNX (3 voices), Coqui `uk/mai/vits` (fallback) | CPU (subprocess) |
+| **Watermark removal** | region inpainting | **LaMa** via IOPaint (QUALITY), `ffmpeg delogo` (FAST) | Metal (MPS) / ffmpeg |
+| **Render** | assemble final video | ffmpeg: H.264 / H.265, mp4 / mkv / mov / webm | VideoToolbox (opt.) |
 
-Выбор устройства — `settings.torch_device()`: `mps` → `cuda` → `cpu`. На Apple Silicon это MPS;
-`PYTORCH_ENABLE_MPS_FALLBACK=1` отправляет на CPU те редкие операции, которых ещё нет на MPS,
-вместо падения.
+Device selection — `settings.torch_device()`: `mps` → `cuda` → `cpu`. On Apple Silicon that's MPS;
+`PYTORCH_ENABLE_MPS_FALLBACK=1` routes the few ops not yet implemented on MPS to the CPU instead
+of crashing.
 
-## Почему именно так — инженерные решения
+## Why it's built this way — engineering decisions
 
-- **Никаких облачных API.** Приватность и работа без интернета — приоритет. Всё крутится
-  локально; единственный сетевой трафик — разовая загрузка весов и (по желанию) видео по ссылке.
+- **No cloud APIs.** Privacy and offline operation are the priority. Everything runs locally; the
+  only network traffic is the one-time weight download and (optionally) a video download by URL.
 
-- **Изолированные venv + subprocess-воркеры.** Движки озвучки и inpainting конфликтуют по
-  зависимостям с ядром (где `transformers 5`) и между собой (разные версии torch, ESPnet / VITS /
-  ONNX). Поэтому каждый из них живёт в своём venv (`.venv-uktts`, `.venv-tts`, `.venv-piper`,
-  `.venv-inpaint`) и вызывается как отдельный процесс. Ядро остаётся чистым и стабильным.
+- **Isolated venvs + subprocess workers.** The dubbing and inpainting engines conflict on
+  dependencies with the core (which uses `transformers 5`) and with each other (different torch
+  versions, ESPnet / VITS / ONNX). So each lives in its own venv (`.venv-uktts`, `.venv-tts`,
+  `.venv-piper`, `.venv-inpaint`) and is invoked as a separate process. The core stays clean and
+  stable.
 
-- **LLM для перевода вместо «дословного».** NLLB переводит буквально; для живого языка
-  по умолчанию используется локальная LLM (Aya) с **контекстным проходом**: модель сначала
-  одним запросом резюмирует тему всего ролика, и этот контекст плюс заголовок/описание видео
-  (из `yt-dlp`) подмешиваются в каждый кусок перевода — так снимается двусмысленность слов
-  (например, «drift» в видео про дрифт переводится по смыслу, а не буквально).
+- **An LLM for translation instead of "literal".** NLLB translates word-for-word; for natural
+  language the default is a local LLM (Aya) with a **context pass**: the model first summarizes the
+  topic of the whole clip in one call, and that context plus the video's title/description (from
+  `yt-dlp`) is mixed into every translation chunk — resolving word-sense ambiguity (e.g. "drift" in
+  a drifting video is translated by meaning, not literally).
 
-- **Параллелизм GPU ∥ CPU.** Inpaint грузит видеокарту, TTS — процессор, поэтому они
-  запускаются одновременно (`ThreadPoolExecutor`). ASR читает оригинальную аудиодорожку, что
-  позволяет ставить inpaint после перевода и совмещать его с озвучкой.
+- **GPU ∥ CPU parallelism.** Inpainting loads the GPU, TTS loads the CPU, so they run at the same
+  time (`ThreadPoolExecutor`). ASR reads the original audio track, which lets inpainting run after
+  translation and overlap with dubbing.
 
-- **Мягкая деградация.** Если LLM-перевод по какой-то причине недоступен, конвейер
-  автоматически откатывается на NLLB и доводит задачу до конца.
+- **Graceful degradation.** If LLM translation is unavailable for any reason, the pipeline
+  automatically falls back to NLLB and finishes the job.
 
-- **Один источник истины для настроек.** `JobConfig` (dataclass в `models.py`) связывает каждый
-  переключатель GUI с движком — интерфейс и конвейер не расходятся.
+- **One source of truth for settings.** `JobConfig` (a dataclass in `models.py`) binds every GUI
+  control to the engine, so the UI and the pipeline never drift apart.
 
-- **Безопасность ffmpeg-фильтрграфа.** Путь проекта содержит пробел, на котором спотыкается
-  фильтр `subtitles`, поэтому файлы субтитров перед прожигом копируются во временный путь без
-  пробелов.
+- **ffmpeg filtergraph safety.** The project path contains a space, which trips the `subtitles`
+  filter, so subtitle files are copied to a space-free temp path before burn-in.
 
-## Карта кода
+## Code map
 
 ```
 vidloc/
-  settings.py          пути, env, выбор устройства (MPS/CPU), HF_HOME → models/
-  models.py            enum'ы + JobConfig (единая конфигурация задачи)
+  settings.py          paths, env, device selection (MPS/CPU), HF_HOME → models/
+  models.py            enums + JobConfig (single source of truth for a job)
   media/
     ffmpeg.py          probe / extract_audio / render_video, VideoToolbox
-    fetch.py           скачивание по URL (yt-dlp), извлечение контекста
-  asr/                 распознавание речи (mlx-whisper)
+    fetch.py           URL download (yt-dlp), context extraction
+  asr/                 speech recognition (mlx-whisper)
   translate/
-    llm.py             натуральный перевод (Aya, MLX) + контекстный проход
-    translator.py      дословный перевод (NLLB-200, MPS)
+    llm.py             natural translation (Aya, MLX) + context pass
+    translator.py      literal translation (NLLB-200, MPS)
   subtitles/
-    srt.py             мягкие субтитры (.srt)
-    ass.py             стилизованные вшитые субтитры (.ass, libass + Montserrat)
-    rechunk.py         нарезка на короткие реплики (TikTok/Reels-вид)
+    srt.py             soft subtitles (.srt)
+    ass.py             styled burned-in subtitles (.ass, libass + Montserrat)
+    rechunk.py         split into short captions (TikTok/Reels look)
   tts/
-    dubbing.py         оркестрация озвучки, тайм-фиттинг к темпу оригинала
-    uktts_worker.py    ukrainian-tts (subprocess в .venv-uktts)
-    piper_worker.py    Piper ONNX (subprocess в .venv-piper)
-    coqui_worker.py    Coqui VITS (subprocess в .venv-tts)
+    dubbing.py         dubbing orchestration, time-fit to the original tempo
+    uktts_worker.py    ukrainian-tts (subprocess in .venv-uktts)
+    piper_worker.py    Piper ONNX (subprocess in .venv-piper)
+    coqui_worker.py    Coqui VITS (subprocess in .venv-tts)
   inpaint/
-    lama.py            нейро-inpainting LaMa через IOPaint (MPS)
-    delogo.py          быстрый ffmpeg delogo
+    lama.py            neural LaMa inpainting via IOPaint (MPS)
+    delogo.py          fast ffmpeg delogo
   pipeline/
-    runner.py          оркестрация всех стадий (см. диаграмму выше)
-    events.py          прогресс и отмена (Reporter / StageTracker)
-  gui/                 PySide6: окно, воркер-поток, выбор региона
-  cli.py               headless-запуск
+    runner.py          orchestration of all stages (see the diagram above)
+    events.py          progress and cancel (Reporter / StageTracker)
+  gui/                 PySide6: window, worker thread, region selector
+  cli.py               headless run
 ```
