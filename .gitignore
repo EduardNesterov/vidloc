@@ -1,0 +1,19 @@
+# Python
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Project data (large / regenerable)
+bin/
+models/
+work/
+output/
+*.log
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# OS
+.DS_Store

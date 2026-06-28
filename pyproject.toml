@@ -1,0 +1,29 @@
+[project]
+name = "vidloc"
+version = "0.1.0"
+description = "Local video localizer: watermark/subtitle removal + EN/RU/IT -> UK translation (subtitles & dubbing)"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "pyside6>=6.6",
+    "mlx-whisper>=0.4.0",
+    "torch>=2.2",
+    "transformers>=4.40",
+    "sentencepiece>=0.2",
+    "huggingface-hub>=0.23",
+    "numpy>=1.26",
+    "soundfile>=0.12",
+    "tqdm>=4.66",
+    "mlx-lm>=0.31.3",
+    "yt-dlp>=2026.6.9",
+]
+
+# TTS / inpainting engines are added in later phases to keep the core install
+# fast and conflict-free:
+#   piper-tts, coqui-tts (XTTS), opencv-python, easyocr/paddleocr, propainter deps
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
