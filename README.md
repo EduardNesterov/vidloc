@@ -52,6 +52,8 @@ PYTHONPATH=. .venv/bin/python -m vidloc.cli input.mp4 \
 
 ## Архитектура
 
+> Подробный разбор логики пайплайна, моделей и инженерных решений — в **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
 ```
 vidloc/
   settings.py        пути, env, выбор устройства (MPS/CPU)
