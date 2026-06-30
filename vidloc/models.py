@@ -194,6 +194,7 @@ class JobConfig:
     input_path: str = ""
     output_path: str = ""
     source_context: str = ""   # extra context for translation (e.g. URL title/description)
+    workspace: str = ""        # per-video cache dir (see vidloc/workspace.py); "" = no cache
     output: OutputConfig = field(default_factory=OutputConfig)
     removal: RemovalConfig = field(default_factory=RemovalConfig)
     translate: TranslateConfig = field(default_factory=TranslateConfig)

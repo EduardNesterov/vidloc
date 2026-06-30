@@ -71,32 +71,65 @@ class PipelineRunner:
 
         src_video = job.input_path
 
+        # ---- workspace cache: reuse the downloaded source + a transcript
+        # already produced for this recognition model, so repeat runs skip
+        # the download and the (slow) ASR pass entirely. ------------------ #
+        ws = None
+        model_key = job.translate.asr_quality.value
+        if job.workspace:
+            from ..workspace import Workspace
+            ws = Workspace.at(job.workspace)
+            # Prefer the explicit input (e.g. an adopted watermark-free file);
+            # fall back to the cached Source copy only when it's missing.
+            if not (job.input_path and Path(job.input_path).exists()):
+                cached_src = ws.source_video()
+                if cached_src:
+                    src_video = str(cached_src)
+
         # ---- ASR ------------------------------------------------------- #
         segments: List[Dict] = []
         detected_lang = job.translate.source.value
         if job.needs_asr:
-            t.start("audio", "Витягую аудіодоріжку…")
-            if not info.has_audio:
-                raise RuntimeError("У відео немає аудіодоріжки — нема що розпізнавати.")
-            wav = str(work / "audio16k.wav")
-            ffmpeg.extract_audio(src_video, wav, duration=info.duration,
-                                 on_progress=lambda f: t.sub(f), on_log=r.log)
-            t.done()
-            self._check()
+            cached = ws.load_transcript(model_key) if ws else None
+            if cached:
+                segments = cached["segments"]
+                detected_lang = cached.get("language") or detected_lang
+                r.log(f"♻ Транскрипт із кешу: {len(segments)} сегментів "
+                      f"(модель «{model_key}») — пропускаю аудіо та розпізнавання.")
+                t.start("audio", "Транскрипт із кешу…")
+                t.done()
+                t.start("asr", "Транскрипт із кешу…")
+                t.done()
+                self._check()
+            else:
+                t.start("audio", "Витягую аудіодоріжку…")
+                if not info.has_audio:
+                    raise RuntimeError("У відео немає аудіодоріжки — нема що розпізнавати.")
+                wav = str(ws.audio_file) if ws else str(work / "audio16k.wav")
+                if not (ws and ws.audio_file.is_file()):
+                    ffmpeg.extract_audio(src_video, wav, duration=info.duration,
+                                         on_progress=lambda f: t.sub(f), on_log=r.log)
+                t.done()
+                self._check()
 
-            t.start("asr", "Розпізнавання мовлення…")
-            asr_model = ASR_MODEL[job.translate.asr_quality]
-            r.log(f"ASR-модель: {asr_model}")
-            from ..asr import transcriber
-            res = transcriber.transcribe(wav, asr_model,
-                                         language=job.translate.source.value,
-                                         on_log=r.log)
-            segments = res["segments"]
-            detected_lang = res["language"]
-            r.log(f"Сегментів розпізнано: {len(segments)} | мова оригіналу: {detected_lang}")
-            t.sub(1.0)
-            t.done()
-            self._check()
+                t.start("asr", "Розпізнавання мовлення…")
+                asr_model = ASR_MODEL[job.translate.asr_quality]
+                r.log(f"ASR-модель: {asr_model}")
+                from ..asr import transcriber
+                res = transcriber.transcribe(wav, asr_model,
+                                             language=job.translate.source.value,
+                                             on_log=r.log)
+                segments = res["segments"]
+                detected_lang = res["language"]
+                r.log(f"Сегментів розпізнано: {len(segments)} | мова оригіналу: {detected_lang}")
+                if ws:
+                    ws.save_transcript(model_key, language=detected_lang,
+                                       segments=segments, model_repo=asr_model,
+                                       text=res.get("text", ""))
+                    r.log(f"💾 Транскрипт збережено в кеш: {ws.model_dir(model_key)}")
+                t.sub(1.0)
+                t.done()
+                self._check()
 
         # ---- 3. translate ---------------------------------------------- #
         if (job.needs_subtitles or job.needs_dubbing) and segments:

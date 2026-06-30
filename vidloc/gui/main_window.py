@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -49,7 +50,7 @@ from ..models import (
     TTSEngine,
     VideoCodec,
 )
-from .worker import DownloadWorker, JobWorker, SaveWorker
+from .worker import DownloadWorker, JobWorker, RecognizeWorker, SaveWorker
 
 STAGE_LABELS = {
     "inpaint": "Видалення об'єктів",
@@ -81,9 +82,15 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(780, 860)
         self.input_path = ""
         self.source_context = ""
+        self.workspace_path = ""          # set once recognition has run for this video
+        self._recognize_after_dl = False  # run recognition once a download finishes
         self.worker: JobWorker | None = None
         self.dl_worker: DownloadWorker | None = None
         self.save_worker: SaveWorker | None = None
+        self.recog_worker: RecognizeWorker | None = None
+        self._can_start = False           # main «Старт» unlocked only after removal step
+        self._removal_run = False         # a removal-only job is currently in flight
+        self._clean_output = ""           # last produced watermark-free video
         self._wm_regions: list = []
         self._hs_region = None
         self._build_ui()
@@ -106,18 +113,31 @@ class MainWindow(QMainWindow):
         inner = QWidget()
         col = QVBoxLayout(inner)
         col.setSpacing(10)
-        col.addWidget(self._downloader_section())
-        col.addWidget(self._removal_section())
-        col.addWidget(self._translate_section())
-        col.addWidget(self._substyle_section())
-        col.addWidget(self._quality_section())
-        col.addWidget(self._tts_section())
-        col.addWidget(self._output_section())
+        self.sec_downloader = self._downloader_section()
+        self.sec_recog = self._recog_section()
+        self.sec_removal = self._removal_section()
+        self.sec_translate = self._translate_section()
+        self.sec_substyle = self._substyle_section()
+        self.sec_tts = self._tts_section()
+        self.sec_output = self._output_section()
+        for sec in (self.sec_downloader, self.sec_recog, self.sec_removal,
+                    self.sec_translate, self.sec_substyle, self.sec_tts,
+                    self.sec_output):
+            col.addWidget(sec)
         col.addStretch(1)
         scroll.setWidget(inner)
         outer.addWidget(scroll, 1)
 
         outer.addWidget(self._run_section())
+
+        # Progressive disclosure: the first screen shows only «Вхідне відео» +
+        # «Завантажувач». A video reveals «Розпізнавання»; once recognition has
+        # run, that step disappears and the remaining sections appear.
+        for sec in (self.sec_recog, self.sec_removal, self.sec_translate,
+                    self.sec_substyle, self.sec_tts, self.sec_output):
+            sec.setVisible(False)
+        self.ed_url.textChanged.connect(self._on_url_changed)
+        self.btn_start.setEnabled(False)   # unlocked only after the removal step
 
     def _input_section(self) -> QGroupBox:
         box = QGroupBox("Вхідне відео")
@@ -169,24 +189,29 @@ class MainWindow(QMainWindow):
     def _removal_section(self) -> QGroupBox:
         box = QGroupBox("Видалення об'єктів (вотермарки / вшиті субтитри)")
         form = QFormLayout(box)
+        self.chk_do_removal = QCheckBox("Видаляти вотермарки / вшиті субтитри")
+        self.chk_do_removal.setChecked(True)
+        self.chk_do_removal.toggled.connect(self._on_removal_toggled)
+        form.addRow(self.chk_do_removal)
+
         self.chk_wm = QCheckBox("Прибрати водяні знаки")
-        btn_wm = QPushButton("Виділити область…")
-        btn_wm.clicked.connect(self._select_wm_region)
+        self.btn_wm = QPushButton("Виділити область…")
+        self.btn_wm.clicked.connect(self._select_wm_region)
         self.lbl_wm = QLabel("не виділено")
         self.lbl_wm.setStyleSheet("color: gray;")
         wm_row = QHBoxLayout()
-        wm_row.addWidget(btn_wm)
+        wm_row.addWidget(self.btn_wm)
         wm_row.addWidget(self.lbl_wm, 1)
         wm_wrap = QWidget()
         wm_wrap.setLayout(wm_row)
 
         self.chk_hs = QCheckBox("Прибрати вшиті субтитри")
-        btn_hs = QPushButton("Виділити смугу субтитрів…")
-        btn_hs.clicked.connect(self._select_hs_region)
+        self.btn_hs = QPushButton("Виділити смугу субтитрів…")
+        self.btn_hs.clicked.connect(self._select_hs_region)
         self.lbl_hs = QLabel("не виділено")
         self.lbl_hs.setStyleSheet("color: gray;")
         hs_row = QHBoxLayout()
-        hs_row.addWidget(btn_hs)
+        hs_row.addWidget(self.btn_hs)
         hs_row.addWidget(self.lbl_hs, 1)
         hs_wrap = QWidget()
         hs_wrap.setLayout(hs_row)
@@ -207,6 +232,17 @@ class MainWindow(QMainWindow):
         note.setWordWrap(True)
         note.setStyleSheet("color: gray;")
         form.addRow(note)
+        self.btn_inpaint = QPushButton("Прибрати →")
+        self.btn_inpaint.setObjectName("inpaintBtn")
+        self.btn_inpaint.clicked.connect(self._on_run_removal)
+        self.btn_skip_removal = QPushButton("Пропустити")
+        self.btn_skip_removal.clicked.connect(self._on_skip_removal)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.btn_inpaint, 1)
+        btn_row.addWidget(self.btn_skip_removal)
+        btn_wrap = QWidget()
+        btn_wrap.setLayout(btn_row)
+        form.addRow(btn_wrap)
         return box
 
     def _preview_pixmap(self):
@@ -266,6 +302,21 @@ class MainWindow(QMainWindow):
             ("Без перекладу (лише обробка відео)", "none"),
         ])
         self.cmb_mode.currentIndexChanged.connect(self._sync_enabled)
+        self.cmb_mt = _combo([
+            ("Натуральний LLM — жива мова, сленг (реком.)", "natural"),
+            ("Швидко (NLLB 600M) — дослівно", "fast"),
+            ("Найкраще (NLLB 1.3B) — дослівно", "best"),
+        ])
+        self.sld_beam = QSlider(Qt.Orientation.Horizontal)
+        self.sld_beam.setRange(1, 8)
+        self.sld_beam.setValue(5)
+        self.lbl_beam = QLabel("5")
+        self.sld_beam.valueChanged.connect(lambda v: self.lbl_beam.setText(str(v)))
+        beam_row = QHBoxLayout()
+        beam_row.addWidget(self.sld_beam, 1)
+        beam_row.addWidget(self.lbl_beam)
+        beam_wrap = QWidget()
+        beam_wrap.setLayout(beam_row)
         self.cmb_subpos = _combo([
             ("М'які — окрема доріжка (вмикаються в плеєрі)", "soft"),
             ("Вшити у відео (hardsub)", "burn"),
@@ -273,8 +324,13 @@ class MainWindow(QMainWindow):
         self.chk_keepsrc = QCheckBox("Додатково зберегти субтитри мовою оригіналу")
         form.addRow("Мова оригіналу:", self.cmb_src)
         form.addRow("Що робимо:", self.cmb_mode)
+        form.addRow("Якість перекладу:", self.cmb_mt)
+        form.addRow("Глибина пошуку (beam):", beam_wrap)
         form.addRow("Субтитри:", self.cmb_subpos)
         form.addRow(self.chk_keepsrc)
+        note = QLabel("Більше beam = якісніше, але повільніше.")
+        note.setStyleSheet("color: gray;")
+        form.addRow("", note)
         return box
 
     def _substyle_section(self) -> QGroupBox:
@@ -354,8 +410,8 @@ class MainWindow(QMainWindow):
         wrap.setLayout(row)
         return wrap
 
-    def _quality_section(self) -> QGroupBox:
-        box = QGroupBox("Швидкість і якість розпізнавання / перекладу")
+    def _recog_section(self) -> QGroupBox:
+        box = QGroupBox("Розпізнавання тексту")
         form = QFormLayout(box)
         self.cmb_asr = _combo([
             ("Швидко (medium)", "fast"),
@@ -363,27 +419,16 @@ class MainWindow(QMainWindow):
             ("Найкраще (large-v3)", "best"),
         ])
         self.cmb_asr.setCurrentIndex(2)
-        self.cmb_mt = _combo([
-            ("Натуральний LLM — жива мова, сленг (реком.)", "natural"),
-            ("Швидко (NLLB 600M) — дослівно", "fast"),
-            ("Найкраще (NLLB 1.3B) — дослівно", "best"),
-        ])
-        self.sld_beam = QSlider(Qt.Orientation.Horizontal)
-        self.sld_beam.setRange(1, 8)
-        self.sld_beam.setValue(5)
-        self.lbl_beam = QLabel("5")
-        self.sld_beam.valueChanged.connect(lambda v: self.lbl_beam.setText(str(v)))
-        beam_row = QHBoxLayout()
-        beam_row.addWidget(self.sld_beam, 1)
-        beam_row.addWidget(self.lbl_beam)
-        beam_wrap = QWidget()
-        beam_wrap.setLayout(beam_row)
-        form.addRow("Якість розпізнавання:", self.cmb_asr)
-        form.addRow("Якість перекладу:", self.cmb_mt)
-        form.addRow("Глибина пошуку (beam):", beam_wrap)
-        hint = QLabel("Більше beam = якісніше, але повільніше.")
-        hint.setStyleSheet("color: gray;")
-        form.addRow("", hint)
+        form.addRow("Модель розпізнавання:", self.cmb_asr)
+        note = QLabel("Оберіть модель і натисніть «Розпізнати»: текст розпізнається "
+                      "один раз і збережеться в кеш. Після цього крок зникне з налаштувань.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray;")
+        form.addRow(note)
+        self.btn_recog = QPushButton("Розпізнати →")
+        self.btn_recog.setObjectName("recogBtn")
+        self.btn_recog.clicked.connect(self._on_recognize)
+        form.addRow(self.btn_recog)
         return box
 
     def _tts_section(self) -> QGroupBox:
@@ -523,7 +568,6 @@ class MainWindow(QMainWindow):
         wants_any = mode != "none"
 
         self.cmb_src.setEnabled(wants_any)
-        self.cmb_asr.setEnabled(wants_any)
         self.cmb_mt.setEnabled(wants_any)
         self.sld_beam.setEnabled(wants_any)
         self.cmb_subpos.setEnabled(wants_text)
@@ -532,6 +576,175 @@ class MainWindow(QMainWindow):
             w.setEnabled(wants_voice)
         # CRF only matters when we actually (re-)encode
         self.sld_crf.setEnabled(self.cmb_codec.currentData() != "keep")
+
+    def _on_url_changed(self, text: str) -> None:
+        """Pasting/typing a link into the URL field reveals «Розпізнавання»."""
+        self.sec_recog.setVisible(bool(text.strip()))
+
+    def _on_recognize(self) -> None:
+        """«Розпізнати»: make sure the video is in a workspace, then run ASR."""
+        if self.input_path and os.path.exists(self.input_path):
+            self._do_recognize()
+        elif self.ed_url.text().strip():
+            # No local file yet — download the link first, then recognize.
+            self._recognize_after_dl = True
+            self._download_url()
+        else:
+            QMessageBox.information(
+                self, "Немає відео",
+                "Спочатку оберіть файл або встав посилання на відео.")
+
+    def _do_recognize(self) -> None:
+        """Cache the source into the workspace, then run (or reuse) ASR."""
+        import shutil
+        from .. import workspace as wsmod
+
+        ws = wsmod.resolve(Path(self.input_path).stem)
+        src = ws.source_video()
+        if src is None:
+            dst = ws.source / Path(self.input_path).name
+            try:
+                shutil.copy2(self.input_path, dst)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.critical(
+                    self, "Workspace", f"Не вдалося скопіювати відео у Source: {exc}")
+                return
+            src = dst
+        ws.write_meta({
+            "name": Path(self.input_path).stem,
+            "source_context": self.source_context,
+            "original_path": self.input_path,
+        })
+        self.workspace_path = str(ws.root)
+        self.input_path = str(src)
+        self.ed_input.setText(self.input_path)
+
+        model = self.cmb_asr.currentData()   # 'fast' | 'balanced' | 'best'
+        if ws.load_transcript(model):
+            QMessageBox.information(
+                self, "Розпізнавання",
+                f"Ця настройка розпізнавання ({model}) для цього відео вже виконана — "
+                "використаю збережений транскрипт із кешу.")
+            self._finish_recognition()
+            return
+
+        # Run ASR off the UI thread; the step disappears once it succeeds.
+        self.btn_recog.setEnabled(False)
+        self.lbl_info.setText("Розпізнавання…")
+        self.recog_worker = RecognizeWorker(
+            self.input_path, self.workspace_path, model, self.cmb_src.currentData())
+        self.recog_worker.sig_progress.connect(
+            lambda f, m: self.lbl_info.setText(f"{m} {int(f * 100)}%"))
+        self.recog_worker.sig_log.connect(self._on_log)
+        self.recog_worker.sig_done.connect(self._on_recognize_done)
+        self.recog_worker.sig_fail.connect(self._on_recognize_fail)
+        self.recog_worker.start()
+
+    def _on_recognize_done(self, n_segments: int) -> None:
+        self.btn_recog.setEnabled(True)
+        self.lbl_info.setText(f"Розпізнано сегментів: {n_segments} ✓")
+        self._finish_recognition()
+
+    def _on_recognize_fail(self, message: str) -> None:
+        self.btn_recog.setEnabled(True)
+        self.lbl_info.setText("Помилка розпізнавання ⚠")
+        QMessageBox.critical(self, "Розпізнавання", message)
+
+    def _finish_recognition(self) -> None:
+        """Recognition done → hide that step + the downloader, and open ONLY the
+        removal step. Subtitles/dub appear after removal is run or skipped."""
+        self.sec_recog.setVisible(False)
+        self.sec_downloader.setVisible(False)   # download-to-disk no longer relevant
+        self.chk_do_removal.setChecked(True)
+        self.sec_removal.setVisible(True)
+        self._suggest_output()
+
+    # -- removal step ---------------------------------------------------- #
+    def _on_removal_toggled(self, on: bool) -> None:
+        """Master toggle: grey out / re-enable the whole removal block."""
+        for w in (self.chk_wm, self.btn_wm, self.lbl_wm, self.chk_hs, self.btn_hs,
+                  self.lbl_hs, self.cmb_inpaint, self.btn_inpaint, self.btn_skip_removal):
+            w.setEnabled(on)
+
+    def _on_run_removal(self) -> None:
+        """«Прибрати»: run inpaint only (no translation) → watermark-free video."""
+        if not self.input_path or not os.path.exists(self.input_path):
+            QMessageBox.warning(self, "Немає файлу", "Спочатку оберіть вхідне відео.")
+            return
+        wm = self.chk_wm.isChecked() and bool(self._wm_regions)
+        hs = self.chk_hs.isChecked() and self._hs_region is not None
+        if not (wm or hs):
+            QMessageBox.information(
+                self, "Видалення",
+                "Позначте, що прибирати, і виділіть область на відео.")
+            return
+        job = self._build_job()
+        job.translate.mode = TranslateMode.NONE   # removal only — no subs/dub
+        stem = Path(self.input_path).stem
+        job.output_path = str(
+            settings.OUTPUT_DIR / f"{stem}_clean.{job.output.container.value}")
+
+        self._removal_run = True
+        self.log.clear()
+        self.progress.setValue(0)
+        self.btn_inpaint.setEnabled(False)
+        self.btn_skip_removal.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.worker = JobWorker(job)
+        self.worker.sig_progress.connect(self._on_progress)
+        self.worker.sig_stage.connect(self._on_stage)
+        self.worker.sig_log.connect(self._on_log)
+        self.worker.sig_done.connect(self._on_done)
+        self.worker.sig_fail.connect(self._on_fail)
+        self.worker.start()
+
+    def _removal_done_dialog(self, out_path: str) -> None:
+        """After removal: «Використати цей файл» / «Показати у Finder» / «Закрити».
+        «Показати у Finder» must NOT close the window, so the user can still adopt
+        the file afterwards — hence a custom QDialog instead of QMessageBox."""
+        self._clean_output = out_path
+        self.btn_skip_removal.setEnabled(self.chk_do_removal.isChecked())
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Готово")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(f"Відео без вотермарок / субтитрів:\n{out_path}"))
+        row = QHBoxLayout()
+        btn_use = QPushButton("Використати цей файл")
+        btn_use.setDefault(True)
+        btn_reveal = QPushButton("Показати у Finder")
+        btn_close = QPushButton("Закрити")
+        row.addWidget(btn_use, 1)
+        row.addWidget(btn_reveal)
+        row.addWidget(btn_close)
+        lay.addLayout(row)
+        # Reveal opens Finder but keeps this dialog open on purpose.
+        btn_reveal.clicked.connect(
+            lambda: subprocess.run(["open", "-R", out_path], check=False))
+        btn_use.clicked.connect(dlg.accept)
+        btn_close.clicked.connect(dlg.reject)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._use_clean_file(out_path)
+
+    def _use_clean_file(self, path: str) -> None:
+        """Adopt the watermark-free video as input and lock the removal step."""
+        self.input_path = path
+        self.ed_input.setText(path)
+        self.lbl_info.setText("Використовується очищене відео (без вотермарок / субтитрів)")
+        self.chk_do_removal.setChecked(False)   # done → block becomes inactive
+        self._reveal_rest_after_removal()
+
+    def _on_skip_removal(self) -> None:
+        """«Пропустити»: skip removal, lock the block, open the rest."""
+        self.chk_do_removal.setChecked(False)
+        self._reveal_rest_after_removal()
+
+    def _reveal_rest_after_removal(self) -> None:
+        """Open subtitles / style / dubbing / output and unlock «Старт»."""
+        for sec in (self.sec_translate, self.sec_substyle, self.sec_tts, self.sec_output):
+            sec.setVisible(True)
+        self._can_start = True
+        self.btn_start.setEnabled(True)
+        self._suggest_output()
 
     def _pick_input(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -550,6 +763,7 @@ class MainWindow(QMainWindow):
                 f"відео: {info.v_codec or '—'} · аудіо: {info.a_codec or 'немає'}")
         except Exception as exc:  # noqa: BLE001
             self.lbl_info.setText(f"Не вдалося прочитати файл: {exc}")
+        self.sec_recog.setVisible(True)   # reveal «Розпізнавання» for picked files too
         self._suggest_output()
 
     def _pick_output(self) -> None:
@@ -596,7 +810,11 @@ class MainWindow(QMainWindow):
                 f"{info.resolution} · {info.duration:.1f} с · {info.fps:.0f} fps{title}")
         except Exception as exc:  # noqa: BLE001
             self.lbl_info.setText(f"Завантажено, але читання не вдалося: {exc}")
+        self.sec_recog.setVisible(True)
         self._suggest_output()
+        if self._recognize_after_dl:
+            self._recognize_after_dl = False
+            self._do_recognize()
 
     def _on_download_fail(self, message: str) -> None:
         self.btn_dl.setEnabled(True)
@@ -670,16 +888,18 @@ class MainWindow(QMainWindow):
             keep_background=self.chk_bg.isChecked(),
             tts_speed=self.sld_speed.value() / 100.0,
         )
+        do_rm = self.chk_do_removal.isChecked()
         rm = RemovalConfig(
-            remove_watermark=self.chk_wm.isChecked() and bool(self._wm_regions),
+            remove_watermark=do_rm and self.chk_wm.isChecked() and bool(self._wm_regions),
             watermark_regions=list(self._wm_regions),
-            remove_hardsubs=self.chk_hs.isChecked() and self._hs_region is not None,
+            remove_hardsubs=do_rm and self.chk_hs.isChecked() and self._hs_region is not None,
             hardsub_region=self._hs_region,
             quality=InpaintQuality(self.cmb_inpaint.currentData()),
         )
         return JobConfig(input_path=self.input_path,
                          output_path=self.ed_out.text(),
                          source_context=self.source_context,
+                         workspace=self.workspace_path,
                          output=out, removal=rm, translate=tr)
 
     def _start(self) -> None:
@@ -719,9 +939,14 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(text.rstrip())
 
     def _on_done(self, out_path: str) -> None:
-        self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.btn_start.setEnabled(self._can_start)
         self.lbl_stage.setText("Готово ✅")
+        if self._removal_run:
+            self._removal_run = False
+            self.btn_inpaint.setEnabled(self.chk_do_removal.isChecked())
+            self._removal_done_dialog(out_path)
+            return
         box = QMessageBox(self)
         box.setWindowTitle("Готово")
         box.setText(f"Файл збережено:\n{out_path}")
@@ -732,7 +957,10 @@ class MainWindow(QMainWindow):
             subprocess.run(["open", "-R", out_path], check=False)
 
     def _on_fail(self, message: str) -> None:
-        self.btn_start.setEnabled(True)
+        self._removal_run = False
         self.btn_cancel.setEnabled(False)
+        self.btn_start.setEnabled(self._can_start)
+        self.btn_inpaint.setEnabled(self.chk_do_removal.isChecked())
+        self.btn_skip_removal.setEnabled(self.chk_do_removal.isChecked())
         self.lbl_stage.setText("Помилка ⚠")
         QMessageBox.critical(self, "Помилка", message)

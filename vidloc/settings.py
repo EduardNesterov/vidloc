@@ -20,6 +20,9 @@ ASSETS_DIR = ROOT / "assets"
 FONTS_DIR = ASSETS_DIR / "fonts"
 MODELS_DIR = Path(os.environ.get("VIDLOC_MODELS_DIR", str(ROOT / "models")))
 WORK_DIR = Path(os.environ.get("VIDLOC_WORK_DIR", str(ROOT / "work")))
+# Persistent per-video cache (downloaded source + ASR transcripts) so repeat
+# runs skip re-downloading and re-transcribing. See vidloc/workspace.py.
+WORKSPACE_DIR = Path(os.environ.get("VIDLOC_WORKSPACE_DIR", str(ROOT / "workspace")))
 OUTPUT_DIR = Path(os.environ.get("VIDLOC_OUTPUT_DIR", str(ROOT / "output")))
 
 # Bundled static ffmpeg/ffprobe (Apple Silicon). Overridable via env.
@@ -39,7 +42,7 @@ def configure_env() -> None:
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     # Avoid tokenizers fork-warning noise inside Qt worker threads.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    for d in (MODELS_DIR, WORK_DIR, OUTPUT_DIR, HF_HOME):
+    for d in (MODELS_DIR, WORK_DIR, WORKSPACE_DIR, OUTPUT_DIR, HF_HOME):
         d.mkdir(parents=True, exist_ok=True)
 
 
