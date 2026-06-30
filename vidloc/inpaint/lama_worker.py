@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
-import sys
 
 import numpy as np
 import torch
@@ -34,6 +33,33 @@ def _read_exact(stream, n: int) -> bytes:
     return bytes(buf)
 
 
+def _region_mask(box, cw, ch, iw, ih, wp, hp, scale, dev):
+    """Per-region masks: downscaled+padded inpaint mask [1,1,hp,wp] and the
+    composite feather [1,1,ch,cw]."""
+    mx, my, mw, mh = box
+    mfull = np.zeros((ch, cw), np.float32)
+    mfull[max(0, my):my + mh, max(0, mx):mx + mw] = 1.0
+    m = torch.from_numpy(mfull)[None, None].to(dev)
+    if scale > 1:                       # dilate so the downscaled mask covers the object
+        d = scale * 4
+        m = (F.max_pool2d(m, 2 * d + 1, stride=1, padding=d) > 0.5).float()
+    mds = F.interpolate(m, size=(ih, iw), mode="bilinear", align_corners=False)
+    mds = (mds > 0.5).float()
+    mp = F.pad(mds, (0, wp - iw, 0, hp - ih))
+    if scale > 1:                       # feather only when downscaling
+        feather = m
+        kf = scale * 4 + 1
+        for _ in range(2):
+            feather = F.avg_pool2d(feather, kf, stride=1, padding=kf // 2)
+    else:
+        feather = m
+    return mp, feather
+
+
+def _active(intervals, t) -> bool:
+    return (not intervals) or any(t0 <= t <= t1 for (t0, t1) in intervals)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
@@ -44,7 +70,7 @@ def main() -> int:
     ap.add_argument("--cy", type=int, required=True)
     ap.add_argument("--cw", type=int, required=True)
     ap.add_argument("--ch", type=int, required=True)
-    ap.add_argument("--boxes", required=True)   # json [[mx,my,mw,mh], ...]
+    ap.add_argument("--regions", required=True)  # json [{"box":[..],"intervals":[[t0,t1]]}]
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--scale", type=int, default=2)
     ap.add_argument("--batch", type=int, default=8)
@@ -55,37 +81,33 @@ def main() -> int:
     dev = "mps" if torch.backends.mps.is_available() else "cpu"
     model = torch.jit.load(a.model, map_location=dev).eval()
     cw, ch = a.cw, a.ch
-    boxes = json.loads(a.boxes)
+    regions_spec = json.loads(a.regions)   # [{"box":[mx,my,mw,mh],"intervals":[[t0,t1],..]}]
     venc = json.loads(a.venc)
-    print(f"WORKER lama in-memory {cw}x{ch} scale={a.scale} batch={a.batch} dev={dev}",
-          flush=True)
-
-    # full-res mask (1 = inpaint)
-    mfull = np.zeros((ch, cw), np.float32)
-    for (mx, my, mw, mh) in boxes:
-        mfull[max(0, my):my + mh, max(0, mx):mx + mw] = 1.0
-    mask_full = torch.from_numpy(mfull)[None, None].to(dev)
-    # When downscaling, the mask erodes — dilate to fully cover the object.
-    if a.scale > 1:
-        d = a.scale * 4
-        mask_full = (F.max_pool2d(mask_full, 2 * d + 1, stride=1, padding=d) > 0.5).float()
+    print(f"WORKER lama in-memory {cw}x{ch} scale={a.scale} batch={a.batch} "
+          f"regions={len(regions_spec)} dev={dev}", flush=True)
 
     iw = max(8, round(cw / a.scale))
     ih = max(8, round(ch / a.scale))
     wp, hp = _ceil8(iw), _ceil8(ih)
-    mds = F.interpolate(mask_full, size=(ih, iw), mode="bilinear", align_corners=False)
-    mds = (mds > 0.5).float()
-    mask_p = F.pad(mds, (0, wp - iw, 0, hp - ih))  # [1,1,hp,wp]
 
-    # feather the composite mask only when downscaling; at full res use the exact
-    # mask for a crisp, artifact-free result.
-    if a.scale > 1:
-        mask_feather = mask_full
-        kf = a.scale * 4 + 1
-        for _ in range(2):
-            mask_feather = F.avg_pool2d(mask_feather, kf, stride=1, padding=kf // 2)
-    else:
-        mask_feather = mask_full
+    # Precompute each region's masks once; per frame we OR the masks of the
+    # regions whose time intervals cover that frame's timestamp.
+    region_masks = []   # (intervals, mask_p[1,1,hp,wp], feather[1,1,ch,cw])
+    for spec in regions_spec:
+        mp, feather = _region_mask(spec["box"], cw, ch, iw, ih, wp, hp, a.scale, dev)
+        region_masks.append(([tuple(iv) for iv in spec.get("intervals", [])], mp, feather))
+    zero_mp = torch.zeros(1, 1, hp, wp, device=dev)
+    zero_feather = torch.zeros(1, 1, ch, cw, device=dev)
+
+    def frame_masks(idx):
+        t = idx / a.fps
+        mp, feather, any_active = zero_mp, zero_feather, False
+        for (intervals, rmp, rfe) in region_masks:
+            if _active(intervals, t):
+                mp = rmp if not any_active else torch.maximum(mp, rmp)
+                feather = rfe if not any_active else torch.maximum(feather, rfe)
+                any_active = True
+        return mp, feather, any_active
 
     framesize = cw * ch * 3
     ff1 = subprocess.Popen(
@@ -101,35 +123,46 @@ def main() -> int:
 
     done = 0
 
-    def flush_batch(frames):
+    def flush_batch(frames, base):
         nonlocal done
         x = torch.from_numpy(np.stack(frames)).to(dev).float().div_(255).permute(0, 3, 1, 2)
-        xi = F.interpolate(x, size=(ih, iw), mode="bilinear", align_corners=False)
-        xi = F.pad(xi, (0, wp - iw, 0, hp - ih))
-        b = xi.shape[0]
-        with torch.no_grad():
-            pred = model(xi, mask_p.expand(b, -1, -1, -1).contiguous())
-        pred = pred[..., :ih, :iw]
-        predf = F.interpolate(pred, size=(ch, cw), mode="bilinear", align_corners=False)
-        out = x * (1 - mask_feather) + predf.clamp(0, 1) * mask_feather
-        out = out.clamp(0, 1).mul_(255).byte().permute(0, 2, 3, 1).contiguous().cpu().numpy()
+        b = x.shape[0]
+        mps, fes, any_active = [], [], False
+        for k in range(b):
+            mp, fe, act = frame_masks(base + k)
+            mps.append(mp)
+            fes.append(fe)
+            any_active = any_active or act
+        if any_active:                        # at least one region active in this batch
+            xi = F.interpolate(x, size=(ih, iw), mode="bilinear", align_corners=False)
+            xi = F.pad(xi, (0, wp - iw, 0, hp - ih))
+            with torch.no_grad():
+                pred = model(xi, torch.cat(mps, dim=0).contiguous())
+            pred = pred[..., :ih, :iw]
+            predf = F.interpolate(pred, size=(ch, cw), mode="bilinear", align_corners=False)
+            feather = torch.cat(fes, dim=0)
+            x = x * (1 - feather) + predf.clamp(0, 1) * feather
+        # else: nothing to erase on these frames -> pass the crop through untouched
+        out = x.clamp(0, 1).mul_(255).byte().permute(0, 2, 3, 1).contiguous().cpu().numpy()
         assert ff2.stdin is not None
         ff2.stdin.write(out.tobytes())
         done += b
         print(f"PROGRESS {done}/{a.total}", flush=True)
 
-    batch = []
+    batch, base, fidx = [], 0, 0
     assert ff1.stdout is not None
     while True:
         buf = _read_exact(ff1.stdout, framesize)
         if len(buf) < framesize:
             break
         batch.append(np.frombuffer(buf, np.uint8).reshape(ch, cw, 3))
+        fidx += 1
         if len(batch) >= a.batch:
-            flush_batch(batch)
+            flush_batch(batch, base)
+            base = fidx
             batch = []
     if batch:
-        flush_batch(batch)
+        flush_batch(batch, base)
 
     ff1.stdout.close()
     ff1.wait()

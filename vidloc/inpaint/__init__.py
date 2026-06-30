@@ -15,9 +15,7 @@ from ..models import InpaintQuality
 def inpaint_video(src, out, removal, info, output=None, reporter=None, on_progress=None) -> str:
     log = reporter.log if reporter else (lambda m: None)
 
-    regions = [tuple(r) for r in (removal.watermark_regions or []) if r]
-    if removal.remove_hardsubs and removal.hardsub_region:
-        regions.append(tuple(removal.hardsub_region))
+    regions = removal.timed_regions()
     if not regions:
         log("Немає виділених областей для затирання — пропускаю крок.")
         shutil.copy(src, out)

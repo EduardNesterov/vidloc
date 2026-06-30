@@ -47,25 +47,31 @@ def lama_video(src, out, regions, info, output=None, scale: int = 2,
     w, h = int(info.width), int(info.height)
     fps = info.fps or 30.0
 
-    # union bounding box of all regions, + context padding
-    px = [(int(round(rx * w)), int(round(ry * h)), int(round(rw * w)), int(round(rh * h)))
-          for (rx, ry, rw, rh) in regions]
+    # pixel rect of every region; their union bbox (+ context padding) is the crop
+    px = [(int(round(r.rect[0] * w)), int(round(r.rect[1] * h)),
+           int(round(r.rect[2] * w)), int(round(r.rect[3] * h))) for r in regions]
     cx = max(0, min(b[0] for b in px) - PAD)
     cy = max(0, min(b[1] for b in px) - PAD)
     cw = _even(min(w, max(b[0] + b[2] for b in px) + PAD) - cx)
     ch = _even(min(h, max(b[1] + b[3] for b in px) + PAD) - cy)
     cw = max(8, min(cw, w - cx))
     ch = max(8, min(ch, h - cy))
-    boxes = [[bx - cx, by - cy, bw, bh] for (bx, by, bw, bh) in px]
+    # each region's box is relative to the crop; intervals stay in seconds
+    worker_regions = [
+        {"box": [bx - cx, by - cy, bw, bh],
+         "intervals": [[float(t0), float(t1)] for (t0, t1) in r.intervals]}
+        for r, (bx, by, bw, bh) in zip(regions, px)
+    ]
 
     venc = video_encoder_args(output, crf=16, codec=VideoCodec.H264)
     total = max(1, round(info.duration * fps))
-    log(f"Нейро-затирання {cw}×{ch} (масштаб ÷{scale}), ~{total} кадрів пачками в пам'яті…")
+    log(f"Нейро-затирання {cw}×{ch} (масштаб ÷{scale}), {len(regions)} обл., "
+        f"~{total} кадрів пачками в пам'яті…")
 
     cmd = [str(INPAINT_PY), str(WORKER),
            "--src", str(src), "--out", str(out), "--ffmpeg", settings.FFMPEG,
            "--model", str(MODEL), "--cx", str(cx), "--cy", str(cy),
-           "--cw", str(cw), "--ch", str(ch), "--boxes", json.dumps(boxes),
+           "--cw", str(cw), "--ch", str(ch), "--regions", json.dumps(worker_regions),
            "--fps", str(fps), "--scale", str(scale), "--batch", "8",
            "--total", str(total), "--venc", json.dumps(venc)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

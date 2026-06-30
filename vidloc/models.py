@@ -160,6 +160,17 @@ class InpaintQuality(str, Enum):
 
 
 @dataclass
+class TimedRegion:
+    """A normalized rectangle (x, y, w, h in 0..1) to erase, active only during
+    the given time intervals (seconds). Empty interval list = the whole video."""
+    rect: tuple
+    intervals: list = field(default_factory=list)  # [(start, end), ...] in seconds
+
+    def active_at(self, t: float) -> bool:
+        return (not self.intervals) or any(t0 <= t <= t1 for (t0, t1) in self.intervals)
+
+
+@dataclass
 class RemovalConfig:
     remove_watermark: bool = False
     # normalized rectangles (x, y, w, h) in 0..1, relative to frame size
@@ -168,6 +179,18 @@ class RemovalConfig:
     # normalized rectangle for the burned-in subtitle band; None = auto-detect
     hardsub_region: Optional[tuple] = None
     quality: InpaintQuality = InpaintQuality.BALANCED
+    # new-style per-region time-gated removal: list[TimedRegion]
+    regions: list = field(default_factory=list)
+
+    def timed_regions(self) -> list:
+        """Unified TimedRegion list: new-style timed regions plus the legacy
+        untimed watermark / hardsub rects (treated as whole-video)."""
+        out = [r for r in self.regions if isinstance(r, TimedRegion)]
+        if self.remove_watermark:
+            out += [TimedRegion(rect=tuple(r)) for r in self.watermark_regions if r]
+        if self.remove_hardsubs and self.hardsub_region:
+            out.append(TimedRegion(rect=tuple(self.hardsub_region)))
+        return out
 
 
 @dataclass
@@ -214,4 +237,5 @@ class JobConfig:
 
     @property
     def needs_inpaint(self) -> bool:
-        return self.removal.remove_watermark or self.removal.remove_hardsubs
+        return (self.removal.remove_watermark or self.removal.remove_hardsubs
+                or bool(self.removal.regions))

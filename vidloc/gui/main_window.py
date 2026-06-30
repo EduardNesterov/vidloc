@@ -50,6 +50,7 @@ from ..models import (
     TTSEngine,
     VideoCodec,
 )
+from .region_editor import RegionEditor
 from .worker import DownloadWorker, JobWorker, RecognizeWorker, SaveWorker
 
 STAGE_LABELS = {
@@ -93,6 +94,7 @@ class MainWindow(QMainWindow):
         self._clean_output = ""           # last produced watermark-free video
         self._wm_regions: list = []
         self._hs_region = None
+        self._regions: list = []          # multi-region editor: normalized (x,y,w,h) rects
         self._build_ui()
         self._sync_enabled()
 
@@ -222,10 +224,21 @@ class MainWindow(QMainWindow):
             ("Швидко (delogo) — грубо", "fast"),
         ])
 
+        self.btn_regions = QPushButton("Області (декілька)…")
+        self.btn_regions.clicked.connect(self._edit_regions)
+        self.lbl_regions = QLabel("рамок: 0")
+        self.lbl_regions.setStyleSheet("color: gray;")
+        reg_row = QHBoxLayout()
+        reg_row.addWidget(self.btn_regions)
+        reg_row.addWidget(self.lbl_regions, 1)
+        reg_wrap = QWidget()
+        reg_wrap.setLayout(reg_row)
+
         form.addRow(self.chk_wm)
         form.addRow("Область вотермарки:", wm_wrap)
         form.addRow(self.chk_hs)
         form.addRow("Смуга субтитрів:", hs_wrap)
+        form.addRow("Кілька областей:", reg_wrap)
         form.addRow("Якість затирання:", self.cmb_inpaint)
         note = QLabel("Виділення доступне після вибору відео. Нейро-режим на M2 "
                       "повільний (хвилини на ролик).")
@@ -413,6 +426,10 @@ class MainWindow(QMainWindow):
     def _recog_section(self) -> QGroupBox:
         box = QGroupBox("Розпізнавання тексту")
         form = QFormLayout(box)
+        self.chk_do_recog = QCheckBox("Розпізнавати текст")
+        self.chk_do_recog.setChecked(True)
+        self.chk_do_recog.toggled.connect(self._on_recog_toggled)
+        form.addRow(self.chk_do_recog)
         self.cmb_asr = _combo([
             ("Швидко (medium)", "fast"),
             ("Збалансовано (large-v3-turbo)", "balanced"),
@@ -428,7 +445,14 @@ class MainWindow(QMainWindow):
         self.btn_recog = QPushButton("Розпізнати →")
         self.btn_recog.setObjectName("recogBtn")
         self.btn_recog.clicked.connect(self._on_recognize)
-        form.addRow(self.btn_recog)
+        self.btn_skip_recog = QPushButton("Пропустити")
+        self.btn_skip_recog.clicked.connect(self._on_skip_recog)
+        row = QHBoxLayout()
+        row.addWidget(self.btn_recog, 1)
+        row.addWidget(self.btn_skip_recog)
+        wrap = QWidget()
+        wrap.setLayout(row)
+        form.addRow(wrap)
         return box
 
     def _tts_section(self) -> QGroupBox:
@@ -630,30 +654,56 @@ class MainWindow(QMainWindow):
 
         # Run ASR off the UI thread; the step disappears once it succeeds.
         self.btn_recog.setEnabled(False)
+        self.btn_skip_recog.setEnabled(False)
+        self.progress.setRange(0, 0)            # busy/indeterminate while recognising
+        self.lbl_stage.setText("Розпізнавання тексту…")
         self.lbl_info.setText("Розпізнавання…")
         self.recog_worker = RecognizeWorker(
             self.input_path, self.workspace_path, model, self.cmb_src.currentData())
-        self.recog_worker.sig_progress.connect(
-            lambda f, m: self.lbl_info.setText(f"{m} {int(f * 100)}%"))
+        self.recog_worker.sig_progress.connect(lambda f, m: self.lbl_stage.setText(m))
         self.recog_worker.sig_log.connect(self._on_log)
         self.recog_worker.sig_done.connect(self._on_recognize_done)
         self.recog_worker.sig_fail.connect(self._on_recognize_fail)
         self.recog_worker.start()
 
     def _on_recognize_done(self, n_segments: int) -> None:
+        self._reset_progress()
         self.btn_recog.setEnabled(True)
+        self.btn_skip_recog.setEnabled(True)
         self.lbl_info.setText(f"Розпізнано сегментів: {n_segments} ✓")
+        self.lbl_stage.setText("Готовий до роботи.")
         self._finish_recognition()
 
     def _on_recognize_fail(self, message: str) -> None:
+        self._reset_progress()
         self.btn_recog.setEnabled(True)
+        self.btn_skip_recog.setEnabled(True)
         self.lbl_info.setText("Помилка розпізнавання ⚠")
         QMessageBox.critical(self, "Розпізнавання", message)
 
+    def _reset_progress(self) -> None:
+        """Restore the determinate 0–100 % bar after an indeterminate phase."""
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+
+    def _on_recog_toggled(self, on: bool) -> None:
+        """Master toggle: grey out / re-enable the recognition controls."""
+        for w in (self.cmb_asr, self.btn_recog, self.btn_skip_recog):
+            w.setEnabled(on)
+
     def _finish_recognition(self) -> None:
-        """Recognition done → hide that step + the downloader, and open ONLY the
-        removal step. Subtitles/dub appear after removal is run or skipped."""
+        """Recognition done → the step disappears; open the removal step."""
         self.sec_recog.setVisible(False)
+        self._proceed_to_removal()
+
+    def _on_skip_recog(self) -> None:
+        """«Пропустити»: skip recognition — grey the block (kept visible so it can
+        be re-enabled via the checkbox) and move on to the removal step."""
+        self.chk_do_recog.setChecked(False)
+        self._proceed_to_removal()
+
+    def _proceed_to_removal(self) -> None:
+        """Hide the downloader and open ONLY the removal step next."""
         self.sec_downloader.setVisible(False)   # download-to-disk no longer relevant
         self.chk_do_removal.setChecked(True)
         self.sec_removal.setVisible(True)
@@ -663,8 +713,38 @@ class MainWindow(QMainWindow):
     def _on_removal_toggled(self, on: bool) -> None:
         """Master toggle: grey out / re-enable the whole removal block."""
         for w in (self.chk_wm, self.btn_wm, self.lbl_wm, self.chk_hs, self.btn_hs,
-                  self.lbl_hs, self.cmb_inpaint, self.btn_inpaint, self.btn_skip_removal):
+                  self.lbl_hs, self.cmb_inpaint, self.btn_inpaint, self.btn_skip_removal,
+                  self.btn_regions):
             w.setEnabled(on)
+
+    def _edit_regions(self) -> None:
+        """Open the region + time editor; regions persist on the window state."""
+        pix = self._preview_pixmap()
+        if pix is None:
+            return
+        dur = 0.0
+        try:
+            dur = ffmpeg.probe(self.input_path).duration
+        except Exception:  # noqa: BLE001
+            pass
+        dlg = RegionEditor(pix, self._regions, duration=dur,
+                           frame_provider=self._frame_at, parent=self)
+        if dlg.exec():
+            self._regions = dlg.result_regions()
+            self.lbl_regions.setText(f"рамок: {len(self._regions)}")
+
+    def _frame_at(self, t: float):
+        """Extract one frame at ``t`` seconds for the editor's scrub preview."""
+        if not self.input_path or not os.path.exists(self.input_path):
+            return None
+        frame = os.path.join(tempfile.gettempdir(), "vidloc_scrub.png")
+        subprocess.run([settings.FFMPEG, "-y", "-loglevel", "error",
+                        "-ss", str(max(0.0, t)), "-i", self.input_path,
+                        "-frames:v", "1", frame], check=False)
+        if not os.path.exists(frame):
+            return None
+        from PySide6.QtGui import QPixmap
+        return QPixmap(frame)
 
     def _on_run_removal(self) -> None:
         """«Прибрати»: run inpaint only (no translation) → watermark-free video."""
@@ -673,7 +753,7 @@ class MainWindow(QMainWindow):
             return
         wm = self.chk_wm.isChecked() and bool(self._wm_regions)
         hs = self.chk_hs.isChecked() and self._hs_region is not None
-        if not (wm or hs):
+        if not (wm or hs or self._regions):
             QMessageBox.information(
                 self, "Видалення",
                 "Позначте, що прибирати, і виділіть область на відео.")
@@ -895,6 +975,7 @@ class MainWindow(QMainWindow):
             remove_hardsubs=do_rm and self.chk_hs.isChecked() and self._hs_region is not None,
             hardsub_region=self._hs_region,
             quality=InpaintQuality(self.cmb_inpaint.currentData()),
+            regions=list(self._regions) if do_rm else [],
         )
         return JobConfig(input_path=self.input_path,
                          output_path=self.ed_out.text(),
