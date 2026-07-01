@@ -184,6 +184,9 @@ class RemovalConfig:
     # reuse-first acceleration: reuse the background plate across frames where it
     # is stable instead of re-running LaMa every frame (neural tiers only)
     reuse: bool = True
+    # erase only the detected text (Apple Vision) inside each box, keeping the
+    # background between/inside the letters (neural tiers only; bypasses reuse)
+    text_only: bool = False
 
     def timed_regions(self) -> list:
         """Unified TimedRegion list: new-style timed regions plus the legacy

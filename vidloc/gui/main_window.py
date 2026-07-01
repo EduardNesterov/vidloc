@@ -231,6 +231,15 @@ class MainWindow(QMainWindow):
             "використовує вже очищений фон. Кратно швидше, особливо для статичного лого "
             "та субтитрів із паузами. Стосується лише нейро-режимів.")
 
+        self.chk_text = QCheckBox("Затирати лише текст у рамці (нейро, Apple Vision)")
+        self.chk_text.setChecked(False)
+        self.chk_text.setToolTip(
+            "У межах рамки знаходить сам текст (Apple Vision, Neural Engine) і затирає "
+            "тільки літери, зберігаючи фон між/усередині них. Краще для тексту на "
+            "детальному фоні. Працює покадрово; reuse у цьому режимі не застосовується.")
+        # text mode and reuse are mutually exclusive (text detects per frame)
+        self.chk_text.toggled.connect(lambda on: self.chk_reuse.setEnabled(not on))
+
         self.btn_regions = QPushButton("Області (декілька)…")
         self.btn_regions.clicked.connect(self._edit_regions)
         self.lbl_regions = QLabel("рамок: 0")
@@ -248,6 +257,7 @@ class MainWindow(QMainWindow):
         form.addRow("Кілька областей:", reg_wrap)
         form.addRow("Якість затирання:", self.cmb_inpaint)
         form.addRow(self.chk_reuse)
+        form.addRow(self.chk_text)
         note = QLabel("Виділення доступне після вибору відео. Нейро-режим на M2 "
                       "повільний (хвилини на ролик).")
         note.setWordWrap(True)
@@ -721,9 +731,11 @@ class MainWindow(QMainWindow):
     def _on_removal_toggled(self, on: bool) -> None:
         """Master toggle: grey out / re-enable the whole removal block."""
         for w in (self.chk_wm, self.btn_wm, self.lbl_wm, self.chk_hs, self.btn_hs,
-                  self.lbl_hs, self.cmb_inpaint, self.chk_reuse, self.btn_inpaint,
-                  self.btn_skip_removal, self.btn_regions):
+                  self.lbl_hs, self.cmb_inpaint, self.chk_reuse, self.chk_text,
+                  self.btn_inpaint, self.btn_skip_removal, self.btn_regions):
             w.setEnabled(on)
+        if on:                       # reuse is bypassed while text mode is active
+            self.chk_reuse.setEnabled(not self.chk_text.isChecked())
 
     def _edit_regions(self) -> None:
         """Open the region + time editor; regions persist on the window state."""
@@ -985,6 +997,7 @@ class MainWindow(QMainWindow):
             quality=InpaintQuality(self.cmb_inpaint.currentData()),
             regions=list(self._regions) if do_rm else [],
             reuse=self.chk_reuse.isChecked(),
+            text_only=self.chk_text.isChecked(),
         )
         return JobConfig(input_path=self.input_path,
                          output_path=self.ed_out.text(),

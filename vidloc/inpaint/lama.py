@@ -40,7 +40,8 @@ def _ensure_model(log) -> None:
 
 def lama_video(src, out, regions, info, output=None, scale: int = 2,
                reporter=None, on_progress=None, reuse: bool = True,
-               reuse_thresh: float = 0.02, reuse_keyint: int = 120) -> str:
+               reuse_thresh: float = 0.02, reuse_keyint: int = 120,
+               text_only: bool = False) -> str:
     log = reporter.log if reporter else (lambda m: None)
     if not INPAINT_PY.exists():
         raise RuntimeError("Середовище інпейнту (.venv-inpaint) не знайдено.")
@@ -77,7 +78,8 @@ def lama_video(src, out, regions, info, output=None, scale: int = 2,
            "--fps", str(fps), "--scale", str(scale), "--batch", "8",
            "--total", str(total), "--venc", json.dumps(venc),
            "--reuse", "1" if reuse else "0",
-           "--reuse-thresh", str(reuse_thresh), "--reuse-keyint", str(reuse_keyint)]
+           "--reuse-thresh", str(reuse_thresh), "--reuse-keyint", str(reuse_keyint),
+           "--text", "1" if text_only else "0"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     assert proc.stdout is not None
@@ -98,9 +100,12 @@ def lama_video(src, out, regions, info, output=None, scale: int = 2,
                 kv = dict(tok.split("=") for tok in line.split()[1:])
                 la, re_ = int(kv["lama_reg"]), int(kv["reuse_reg"])
                 gpu, fr = int(kv["gpu_frames"]), int(kv["frames"])
-                saved = 100 * re_ / max(1, la + re_)
-                log(f"LaMa-проходів: {gpu}/{fr} кадрів; фон повторно використано у "
-                    f"{re_} з {la + re_} обл.-кадрів ({saved:.0f}%)")
+                msg = f"LaMa-проходів: {gpu}/{fr} кадрів"
+                if re_ > 0:      # reuse path — report how much background was reused
+                    saved = 100 * re_ / max(1, la + re_)
+                    msg += (f"; фон повторно використано у {re_} з {la + re_} "
+                            f"обл.-кадрів ({saved:.0f}%)")
+                log(msg)
             except (ValueError, KeyError):
                 log(line)
         elif line and ("ERROR" in line or "Traceback" in line or line.startswith("WORKER")):
