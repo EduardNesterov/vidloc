@@ -181,6 +181,9 @@ class RemovalConfig:
     quality: InpaintQuality = InpaintQuality.BALANCED
     # new-style per-region time-gated removal: list[TimedRegion]
     regions: list = field(default_factory=list)
+    # reuse-first acceleration: reuse the background plate across frames where it
+    # is stable instead of re-running LaMa every frame (neural tiers only)
+    reuse: bool = True
 
     def timed_regions(self) -> list:
         """Unified TimedRegion list: new-style timed regions plus the legacy

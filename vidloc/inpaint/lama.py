@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections import deque
 from pathlib import Path
 
 from .. import settings
@@ -38,7 +39,8 @@ def _ensure_model(log) -> None:
 
 
 def lama_video(src, out, regions, info, output=None, scale: int = 2,
-               reporter=None, on_progress=None) -> str:
+               reporter=None, on_progress=None, reuse: bool = True,
+               reuse_thresh: float = 0.02, reuse_keyint: int = 120) -> str:
     log = reporter.log if reporter else (lambda m: None)
     if not INPAINT_PY.exists():
         raise RuntimeError("Середовище інпейнту (.venv-inpaint) не знайдено.")
@@ -73,12 +75,17 @@ def lama_video(src, out, regions, info, output=None, scale: int = 2,
            "--model", str(MODEL), "--cx", str(cx), "--cy", str(cy),
            "--cw", str(cw), "--ch", str(ch), "--regions", json.dumps(worker_regions),
            "--fps", str(fps), "--scale", str(scale), "--batch", "8",
-           "--total", str(total), "--venc", json.dumps(venc)]
+           "--total", str(total), "--venc", json.dumps(venc),
+           "--reuse", "1" if reuse else "0",
+           "--reuse-thresh", str(reuse_thresh), "--reuse-keyint", str(reuse_keyint)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     assert proc.stdout is not None
+    tail: deque[str] = deque(maxlen=15)   # recent output, surfaced if the worker dies
     for line in proc.stdout:
         line = line.strip()
+        if not line.startswith("PROGRESS"):
+            tail.append(line)
         if line.startswith("PROGRESS"):
             try:
                 d, tt = line.split()[1].split("/")
@@ -86,11 +93,24 @@ def lama_video(src, out, regions, info, output=None, scale: int = 2,
                     on_progress(min(0.99, int(d) / max(1, int(tt))))
             except (ValueError, IndexError):
                 pass
+        elif line.startswith("STAT"):
+            try:
+                kv = dict(tok.split("=") for tok in line.split()[1:])
+                la, re_ = int(kv["lama_reg"]), int(kv["reuse_reg"])
+                gpu, fr = int(kv["gpu_frames"]), int(kv["frames"])
+                saved = 100 * re_ / max(1, la + re_)
+                log(f"LaMa-проходів: {gpu}/{fr} кадрів; фон повторно використано у "
+                    f"{re_} з {la + re_} обл.-кадрів ({saved:.0f}%)")
+            except (ValueError, KeyError):
+                log(line)
         elif line and ("ERROR" in line or "Traceback" in line or line.startswith("WORKER")):
             log(line)
         if reporter and reporter.cancelled:
             proc.terminate()
             raise RuntimeError("Скасовано")
     if proc.wait() != 0:
-        raise RuntimeError(f"lama-воркер завершився з кодом {proc.returncode}")
+        detail = " | ".join(t for t in tail if t)
+        raise RuntimeError(
+            f"lama-воркер завершився з кодом {proc.returncode}"
+            + (f": {detail}" if detail else ""))
     return str(out)

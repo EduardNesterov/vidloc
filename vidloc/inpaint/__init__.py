@@ -31,7 +31,8 @@ def inpaint_video(src, out, removal, info, output=None, reporter=None, on_progre
         scale = 1 if removal.quality == InpaintQuality.BEST else 2
         try:
             lama_video(src, out, regions, info, output=output, scale=scale,
-                       reporter=reporter, on_progress=on_progress)
+                       reporter=reporter, on_progress=on_progress,
+                       reuse=getattr(removal, "reuse", True))
         except Exception as exc:  # noqa: BLE001 — degrade rather than fail the whole job
             log(f"⚠ Нейро-затирання не вдалося ({exc}); відкочуюсь на швидке (delogo).")
             from .delogo import delogo_video

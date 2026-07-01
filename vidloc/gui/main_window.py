@@ -224,6 +224,13 @@ class MainWindow(QMainWindow):
             ("Швидко (delogo) — грубо", "fast"),
         ])
 
+        self.chk_reuse = QCheckBox("Прискорення reuse-first (повторне використання фону)")
+        self.chk_reuse.setChecked(True)
+        self.chk_reuse.setToolTip(
+            "Затирає LaMa лише там, де фон змінився, а на стабільних кадрах повторно "
+            "використовує вже очищений фон. Кратно швидше, особливо для статичного лого "
+            "та субтитрів із паузами. Стосується лише нейро-режимів.")
+
         self.btn_regions = QPushButton("Області (декілька)…")
         self.btn_regions.clicked.connect(self._edit_regions)
         self.lbl_regions = QLabel("рамок: 0")
@@ -240,6 +247,7 @@ class MainWindow(QMainWindow):
         form.addRow("Смуга субтитрів:", hs_wrap)
         form.addRow("Кілька областей:", reg_wrap)
         form.addRow("Якість затирання:", self.cmb_inpaint)
+        form.addRow(self.chk_reuse)
         note = QLabel("Виділення доступне після вибору відео. Нейро-режим на M2 "
                       "повільний (хвилини на ролик).")
         note.setWordWrap(True)
@@ -713,8 +721,8 @@ class MainWindow(QMainWindow):
     def _on_removal_toggled(self, on: bool) -> None:
         """Master toggle: grey out / re-enable the whole removal block."""
         for w in (self.chk_wm, self.btn_wm, self.lbl_wm, self.chk_hs, self.btn_hs,
-                  self.lbl_hs, self.cmb_inpaint, self.btn_inpaint, self.btn_skip_removal,
-                  self.btn_regions):
+                  self.lbl_hs, self.cmb_inpaint, self.chk_reuse, self.btn_inpaint,
+                  self.btn_skip_removal, self.btn_regions):
             w.setEnabled(on)
 
     def _edit_regions(self) -> None:
@@ -976,6 +984,7 @@ class MainWindow(QMainWindow):
             hardsub_region=self._hs_region,
             quality=InpaintQuality(self.cmb_inpaint.currentData()),
             regions=list(self._regions) if do_rm else [],
+            reuse=self.chk_reuse.isChecked(),
         )
         return JobConfig(input_path=self.input_path,
                          output_path=self.ed_out.text(),
