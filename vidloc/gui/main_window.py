@@ -51,7 +51,7 @@ from ..models import (
     VideoCodec,
 )
 from .region_editor import RegionEditor
-from .worker import DownloadWorker, JobWorker, RecognizeWorker, SaveWorker
+from .worker import DownloadWorker, JobWorker, ProxyWorker, RecognizeWorker, SaveWorker
 
 STAGE_LABELS = {
     "inpaint": "Видалення об'єктів",
@@ -89,6 +89,8 @@ class MainWindow(QMainWindow):
         self.dl_worker: DownloadWorker | None = None
         self.save_worker: SaveWorker | None = None
         self.recog_worker: RecognizeWorker | None = None
+        self._proxy_worker: ProxyWorker | None = None
+        self._proxy_ready_path = ""        # editor preview proxy, once prewarmed
         self._can_start = False           # main «Старт» unlocked only after removal step
         self._removal_run = False         # a removal-only job is currently in flight
         self._clean_output = ""           # last produced watermark-free video
@@ -243,6 +245,14 @@ class MainWindow(QMainWindow):
             "статичному лого та субтитрах із паузами. Тип рамки задається у редакторі "
             "областей; для рамок «Текст» reuse не застосовується.")
 
+        self.chk_master = QCheckBox("Читати з H.264-майстра (швидкий декод AV1)")
+        self.chk_master.setChecked(True)
+        self.chk_master.setToolTip(
+            "Затирання декодує підготовлений повнорозмірний H.264-майстер (той самий, "
+            "що й для перегляду) замість повільного AV1 — декод ≈10× швидший, а воркер "
+            "читає джерело двічі за прохід. Найбільший виграш на статиці / субтитрах із "
+            "паузами. Вимкни, якщо потрібен піксель-в-піксель із оригінального AV1.")
+
         self.btn_regions = QPushButton("Області (декілька)…")
         self.btn_regions.clicked.connect(self._edit_regions)
         self.lbl_regions = QLabel("рамок: 0")
@@ -261,6 +271,7 @@ class MainWindow(QMainWindow):
         form.addRow("Якість затирання:", self.cmb_inpaint)
         form.addRow("Кодування:", self.cmb_enc)
         form.addRow(self.chk_reuse)
+        form.addRow(self.chk_master)
         note = QLabel("Виділення доступне після вибору відео. Тип кожної рамки (об'єкт "
                       "або текст) задається в редакторі областей. Нейро-режим на M2 "
                       "повільний (хвилини на ролик).")
@@ -664,6 +675,7 @@ class MainWindow(QMainWindow):
         self.workspace_path = str(ws.root)
         self.input_path = str(src)
         self.ed_input.setText(self.input_path)
+        self._prewarm_proxy()                # overlap proxy build with ASR (lead time)
 
         model = self.cmb_asr.currentData()   # 'fast' | 'balanced' | 'best'
         if ws.load_transcript(model):
@@ -730,12 +742,37 @@ class MainWindow(QMainWindow):
         self.chk_do_removal.setChecked(True)
         self.sec_removal.setVisible(True)
         self._suggest_output()
+        self._prewarm_proxy()
+
+    def _prewarm_proxy(self) -> None:
+        """Build the region-editor preview proxy in the background so scrubbing is
+        instant by the time the user opens «Області». Idempotent — safe to call at
+        several points (workspace ready, removal step) without double-building; the
+        AV1 decode is heavy, so we never want two builds racing for the CPU."""
+        if not self.input_path or not os.path.exists(self.input_path):
+            return
+        from ..media import proxy
+        cached = proxy.proxy_path(self.input_path)
+        if cached.exists() and proxy.is_valid(str(cached)):
+            self._proxy_ready_path = str(cached)          # already built earlier
+            return
+        if (self._proxy_worker is not None and self._proxy_worker.isRunning()
+                and getattr(self._proxy_worker, "src", "") == self.input_path):
+            return                                        # a build is already running
+        self._proxy_ready_path = ""
+        self._proxy_worker = ProxyWorker(self.input_path, self)
+        self._proxy_worker.sig_ready.connect(self._on_proxy_ready)
+        self._proxy_worker.start()
+
+    def _on_proxy_ready(self, path: str) -> None:
+        self._proxy_ready_path = path
 
     # -- removal step ---------------------------------------------------- #
     def _on_removal_toggled(self, on: bool) -> None:
         """Master toggle: grey out / re-enable the whole removal block."""
         for w in (self.chk_wm, self.btn_wm, self.lbl_wm, self.chk_hs, self.btn_hs,
                   self.lbl_hs, self.cmb_inpaint, self.cmb_enc, self.chk_reuse,
+                  self.chk_master,
                   self.btn_inpaint, self.btn_skip_removal, self.btn_regions):
             w.setEnabled(on)
 
@@ -750,7 +787,9 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
         dlg = RegionEditor(pix, self._regions, duration=dur,
-                           frame_provider=self._frame_at, parent=self)
+                           frame_provider=self._frame_at, src=self.input_path,
+                           proxy_ready=self._proxy_ready_path or None,
+                           proxy_worker=self._proxy_worker, parent=self)
         if dlg.exec():
             self._regions = dlg.result_regions()
             self.lbl_regions.setText(f"рамок: {len(self._regions)}")
@@ -1001,6 +1040,7 @@ class MainWindow(QMainWindow):
             quality=InpaintQuality(self.cmb_inpaint.currentData()),
             regions=list(self._regions) if do_rm else [],
             reuse=self.chk_reuse.isChecked(),
+            use_master=self.chk_master.isChecked(),
         )
         return JobConfig(input_path=self.input_path,
                          output_path=self.ed_out.text(),

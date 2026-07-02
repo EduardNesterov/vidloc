@@ -10,6 +10,59 @@ from ..models import JobConfig
 from ..pipeline import Cancelled, PipelineRunner, Reporter
 
 
+class ProxyWorker(QThread):
+    """Builds the editor scrub preview + the full-res inpaint master off the UI
+    thread, in a single ffmpeg pass (one AV1 decode feeds both).
+
+    If both are already cached and valid it emits ``sig_ready`` immediately;
+    otherwise it renders to unique temp files and atomically renames them into the
+    cache, so a half-written / clobbered file is never picked up as valid.
+    """
+
+    sig_progress = Signal(float)     # 0..1
+    sig_ready = Signal(str)          # preview (scrub) path
+    sig_fail = Signal(str)
+
+    def __init__(self, src: str, parent=None):
+        super().__init__(parent)
+        self.src = src
+
+    def run(self) -> None:
+        import uuid
+
+        try:
+            from ..media import ffmpeg, proxy
+            preview = proxy.proxy_path(self.src)
+            master = proxy.master_path(self.src)
+            if (preview.exists() and proxy.is_valid(str(preview))
+                    and master.exists() and proxy.is_valid(str(master))):
+                self.sig_ready.emit(str(preview))
+                return
+            dur = 0.0
+            try:
+                dur = ffmpeg.probe(self.src).duration
+            except Exception:  # noqa: BLE001 — progress is best-effort
+                pass
+            # Unique temps per worker: prewarm (main window) and the editor may
+            # build concurrently — a shared temp would clobber into garbage. Both
+            # produce valid files; the atomic replace() lets last win.
+            tag = uuid.uuid4().hex[:8]
+            tmp_m = master.with_name(f"{master.stem}.part.{tag}.mp4")
+            tmp_p = preview.with_name(f"{preview.stem}.part.{tag}.mp4")
+            try:
+                proxy.build(self.src, str(tmp_m), str(tmp_p), duration=dur,
+                            on_progress=lambda f: self.sig_progress.emit(f or 0.0))
+                tmp_m.replace(master)
+                tmp_p.replace(preview)
+            except Exception:
+                tmp_m.unlink(missing_ok=True)
+                tmp_p.unlink(missing_ok=True)
+                raise
+            self.sig_ready.emit(str(preview))
+        except Exception as exc:  # noqa: BLE001
+            self.sig_fail.emit(f"{type(exc).__name__}: {exc}")
+
+
 class DownloadWorker(QThread):
     """Downloads a video from a URL (yt-dlp) off the UI thread."""
 

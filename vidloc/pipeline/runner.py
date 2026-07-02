@@ -204,8 +204,17 @@ class PipelineRunner:
             def _inpaint_task():
                 try:
                     from ..inpaint import inpaint_video
+                    from ..media import proxy
                     cleaned = str(work / "cleaned.mp4")
-                    inpaint_video(job.input_path, cleaned, job.removal, info,
+                    # Decode from the fast H.264 master when available (≈10× faster
+                    # than libaom AV1; the worker decodes the source twice per run).
+                    inp_src = job.input_path
+                    if getattr(job.removal, "use_master", True):
+                        m = proxy.master_path(job.input_path)
+                        if m.exists() and proxy.is_valid(str(m)):
+                            inp_src = str(m)
+                            r.log("Затирання: читаю з H.264-майстра (швидкий декод).")
+                    inpaint_video(inp_src, cleaned, job.removal, info,
                                   output=job.output, reporter=r,
                                   on_progress=lambda f: _bump("inp", f))
                     results["cleaned"] = cleaned

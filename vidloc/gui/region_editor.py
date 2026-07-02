@@ -11,10 +11,19 @@ interval list means the region erases for the whole video.
 
 from __future__ import annotations
 
+import threading
 from typing import Callable, List, Optional
 
-from PySide6.QtCore import QPoint, QRect, Qt
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtCore import QTimer, QUrl, QPoint, QRect, Qt
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtMultimedia import (
+    QAudioFormat,
+    QAudioOutput,
+    QAudioSink,
+    QMediaDevices,
+    QMediaPlayer,
+    QVideoSink,
+)
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -27,7 +36,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..media import proxy
 from ..models import TimedRegion
+from .worker import ProxyWorker
 
 MAX_REGIONS = 15
 _ACCENT = QColor("#2d7d46")
@@ -378,6 +389,8 @@ class _Timeline(QWidget):
 class RegionEditor(QDialog):
     def __init__(self, pixmap: QPixmap, regions: Optional[List[TimedRegion]] = None,
                  duration: float = 0.0, frame_provider: Optional[Callable] = None,
+                 src: Optional[str] = None, proxy_ready: Optional[str] = None,
+                 proxy_worker: Optional[ProxyWorker] = None,
                  parent=None, title: str = "Області та час для видалення"):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -385,6 +398,19 @@ class RegionEditor(QDialog):
         self.regions: List[TimedRegion] = [r for r in (regions or [])][:MAX_REGIONS]
         self.duration = duration
         self._frame_provider = frame_provider
+        self._src = src
+        self._proxy_ready = proxy_ready     # prewarmed proxy path, if already done
+        self._prewarm_worker = proxy_worker  # main window's in-flight prewarm, if any
+
+        # -- media/preview state ------------------------------------------ #
+        self._player_ready = False          # proxy loaded + primed → smooth scrub
+        self._priming = False
+        self._proxy_loaded = False          # source set on the player (once)
+        self._player: Optional[QMediaPlayer] = None
+        self._proxy_worker: Optional[ProxyWorker] = None
+        self._pcm = b""                     # mono s16le buffer for jog audio
+        self._audio_sink: Optional[QAudioSink] = None
+        self._jog_io = None                 # QIODevice from the running sink
 
         lay = QVBoxLayout(self)
         self.canvas = _Canvas(pixmap, self.regions, self._refresh)
@@ -396,27 +422,43 @@ class RegionEditor(QDialog):
         hint.setStyleSheet("color: gray;")
         lay.addWidget(hint)
 
-        if duration > 0 and frame_provider is not None:
+        self.slider = None
+        self.btn_play = None
+        if duration > 0 and (src or frame_provider is not None):
+            self.btn_play = QPushButton("▶")
+            self.btn_play.setFixedWidth(40)
+            self.btn_play.setToolTip("Відтворити / пауза (зі звуком)")
+            self.btn_play.clicked.connect(self._toggle_play)
             self.slider = QSlider(Qt.Orientation.Horizontal)
-            self.slider.setRange(0, 1000)
-            self.slider.valueChanged.connect(self._on_scrub_value)
-            self.slider.sliderReleased.connect(self._on_scrub_release)
-            lay.addWidget(self.slider)
-        else:
-            self.slider = None
+            self.slider.setRange(0, max(1, int(duration * 1000)))
+            self.slider.sliderPressed.connect(self._on_slider_pressed)
+            self.slider.sliderMoved.connect(self._on_slider_moved)
+            self.slider.sliderReleased.connect(self._on_slider_released)
+            play_row = QHBoxLayout()
+            play_row.addWidget(self.btn_play)
+            play_row.addWidget(self.slider, 1)
+            lay.addLayout(play_row)
+            self.lbl_prep = QLabel("")
+            self.lbl_prep.setStyleSheet("color:#37b6ff;")
+            self.lbl_prep.setVisible(False)
+            lay.addWidget(self.lbl_prep)
+            self._setup_player()
 
         sel_row = QHBoxLayout()
         self.lbl_sel = QLabel("")
         self.cmb_kind = QComboBox()
         self.cmb_kind.addItem("Об'єкт / лого (reuse фону)", "object")
         self.cmb_kind.addItem("Текст / субтитри (Vision — лише літери)", "text")
+        self.cmb_kind.addItem("Текст-заливка (караоке / стилізований, без OCR)", "caption")
         self.cmb_kind.addItem("Статичний фон (затерти раз, заморозити)", "static")
         self.cmb_kind.setToolTip(
             "Тип обраної рамки. «Об'єкт»: затирає весь прямокутник, повторно використовує "
             "фон і пере-затирає при русі фону. «Текст»: Apple Vision стирає лише літери, "
-            "зберігаючи фон між ними (субтитри/підписи). «Статичний фон»: затирає один раз "
-            "і вставляє на всі кадри без перевірки — найшвидше і без мерехтіння, але дасть "
-            "«наклейку», якщо фон за рамкою рухається (бери лише коли фон нерухомий).")
+            "зберігаючи фон між ними (субтитри/підписи). «Текст-заливка»: для стилізованих / "
+            "караоке / низькоконтрастних субтитрів, які Vision не розпізнає — покриває весь "
+            "текст за структурою зображення (без OCR); обводь смугу тісно по рядку. "
+            "«Статичний фон»: затирає один раз і вставляє на всі кадри без перевірки — "
+            "найшвидше і без мерехтіння, але дасть «наклейку», якщо фон за рамкою рухається.")
         self.cmb_kind.currentIndexChanged.connect(self._on_kind_changed)
         sel_row.addWidget(self.lbl_sel, 1)
         sel_row.addWidget(QLabel("Тип рамки:"))
@@ -468,25 +510,207 @@ class RegionEditor(QDialog):
         if 0 <= i < len(self.regions):
             self.regions[i].kind = self.cmb_kind.currentData()
 
+    # -- scrubbing (timeline click / bracket drag) --------------------- #
     def _on_timeline_scrub(self, t: float) -> None:
-        if self.slider is not None:
-            self.slider.blockSignals(True)
-            self.slider.setValue(int(1000 * t / max(0.01, self.duration)))
-            self.slider.blockSignals(False)
-        self._show_frame(t)
+        self._seek(t, move_slider=True)
 
-    def _on_scrub_value(self, v: int) -> None:
-        self.timeline.playhead = (v / 1000.0) * self.duration
+    def _seek(self, t: float, *, move_slider: bool) -> None:
+        """Jump preview + playhead to ``t`` seconds (player if ready, else frame)."""
+        t = min(max(0.0, t), self.duration)
+        self.timeline.playhead = t
         self.timeline.update()
-
-    def _on_scrub_release(self) -> None:
-        self._show_frame((self.slider.value() / 1000.0) * self.duration)
-
-    def _show_frame(self, t: float) -> None:
-        if self._frame_provider is not None:
-            pm = self._frame_provider(t)
+        if move_slider and self.slider is not None:
+            self.slider.blockSignals(True)
+            self.slider.setValue(int(t * 1000))
+            self.slider.blockSignals(False)
+        if self._player_ready and self._player is not None:
+            self._player.setPosition(int(t * 1000))       # frame arrives via sink
+        elif self._frame_provider is not None:
+            pm = self._frame_provider(t)                  # fallback: extract 1 frame
             if pm is not None and not pm.isNull():
                 self.canvas.set_pixmap(pm)
+
+    # -- media player (smooth scrub + audio via H.264 proxy) ----------- #
+    def _setup_player(self) -> None:
+        self._player = QMediaPlayer(self)
+        self._audio_out = QAudioOutput(self)
+        self._sink = QVideoSink(self)
+        self._player.setAudioOutput(self._audio_out)
+        self._player.setVideoSink(self._sink)
+        self._sink.videoFrameChanged.connect(self._on_video_frame)
+        self._player.positionChanged.connect(self._on_position)
+        self._player.playbackStateChanged.connect(self._on_playstate)
+        self._player.mediaStatusChanged.connect(self._on_media_status)
+        if self.btn_play is not None:
+            self.btn_play.setEnabled(False)              # until the proxy is ready
+        # Coordinate with the main window's prewarm so we never build the same
+        # proxy twice (concurrent full-res decodes compete for the CPU).
+        import os
+        if self._proxy_ready and os.path.exists(self._proxy_ready):
+            self._on_proxy_ready(self._proxy_ready)      # already built by prewarm
+        elif self._prewarm_worker is not None and self._prewarm_worker.isRunning():
+            self.lbl_prep.setText("Готую плавний перегляд (перекодування у H.264)…")
+            self.lbl_prep.setVisible(True)
+            self._prewarm_worker.sig_progress.connect(self._on_proxy_progress)
+            self._prewarm_worker.sig_ready.connect(self._on_proxy_ready)  # ride along
+        elif self._src:
+            self.lbl_prep.setText("Готую плавний перегляд (перекодування у H.264)…")
+            self.lbl_prep.setVisible(True)
+            self._proxy_worker = ProxyWorker(self._src, self)
+            self._proxy_worker.sig_progress.connect(self._on_proxy_progress)
+            self._proxy_worker.sig_ready.connect(self._on_proxy_ready)
+            self._proxy_worker.start()
+
+    def _on_proxy_progress(self, f: float) -> None:
+        if not self._player_ready:
+            self.lbl_prep.setText(f"Готую плавний перегляд… {int(f * 100)}% "
+                                  "(поки що перемотка по кадру на відпускання)")
+
+    def _on_proxy_ready(self, path: str) -> None:
+        if not self._player or self._proxy_loaded:
+            return
+        self._proxy_loaded = True
+        self._player.setSource(QUrl.fromLocalFile(path))
+        # jog-audio PCM: decode in a plain thread (only sets a bytes attribute).
+        if self._src:
+            threading.Thread(
+                target=lambda: setattr(self, "_pcm", proxy.load_pcm(self._src)),
+                daemon=True).start()
+
+    def _on_media_status(self, status) -> None:
+        if status == QMediaPlayer.MediaStatus.LoadedMedia and not self._priming \
+                and not self._player_ready:
+            # Qt's ffmpeg backend only pushes frames once the pipeline has been
+            # primed by playing; after a brief muted prime, a paused setPosition()
+            # emits exactly one frame — that is our instant scrub.
+            self._priming = True
+            self._audio_out.setMuted(True)
+            self._player.play()
+            QTimer.singleShot(150, self._finish_prime)
+
+    def _finish_prime(self) -> None:
+        if self._player is None:
+            return
+        self._player.pause()
+        self._audio_out.setMuted(False)
+        self._priming = False
+        self._player_ready = True
+        self.lbl_prep.setVisible(False)
+        if self.btn_play is not None:
+            self.btn_play.setEnabled(True)
+        self._player.setPosition(int(self.timeline.playhead * 1000))
+
+    def _on_video_frame(self, frame) -> None:
+        if not frame.isValid():
+            return
+        img: QImage = frame.toImage()
+        if not img.isNull():
+            self.canvas.set_pixmap(QPixmap.fromImage(img))
+
+    def _on_position(self, ms: int) -> None:
+        t = ms / 1000.0
+        self.timeline.playhead = t
+        self.timeline.update()
+        if self.slider is not None and not self.slider.isSliderDown():
+            self.slider.blockSignals(True)
+            self.slider.setValue(ms)
+            self.slider.blockSignals(False)
+
+    def _on_playstate(self, state) -> None:
+        if self.btn_play is not None:
+            playing = state == QMediaPlayer.PlaybackState.PlayingState
+            self.btn_play.setText("⏸" if playing else "▶")
+
+    def _toggle_play(self) -> None:
+        if not self._player_ready or self._player is None:
+            return
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._player.pause()
+        else:
+            self._player.play()
+
+    # -- slider drag: instant scrub + jog ("shuttle") audio ------------ #
+    def _on_slider_pressed(self) -> None:
+        if self._player is not None:
+            self._player.pause()             # continuous audio off; jog takes over
+        self._start_jog()
+
+    def _on_slider_moved(self, v: int) -> None:
+        t = v / 1000.0
+        self.timeline.playhead = t
+        self.timeline.update()
+        if self._player_ready and self._player is not None:
+            self._player.setPosition(v)          # cheap: 1 frame from primed player
+            self._jog_grain(v)
+        # Fallback (proxy not ready): do NOT extract per move — full-res decode on
+        # every drag event is what made it lag. The frame updates on release only.
+
+    def _on_slider_released(self) -> None:
+        self._stop_jog()
+        if self.slider is None:
+            return
+        t = self.slider.value() / 1000.0
+        self.timeline.playhead = t
+        self.timeline.update()
+        if self._player_ready and self._player is not None:
+            self._player.setPosition(int(t * 1000))
+        elif self._frame_provider is not None:
+            pm = self._frame_provider(t)          # one extraction, like before
+            if pm is not None and not pm.isNull():
+                self.canvas.set_pixmap(pm)
+
+    def _ensure_audio_sink(self) -> Optional[QAudioSink]:
+        if self._audio_sink is not None:
+            return self._audio_sink
+        fmt = QAudioFormat()
+        fmt.setSampleRate(proxy.JOG_SR)
+        fmt.setChannelCount(1)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        dev = QMediaDevices.defaultAudioOutput()
+        if dev.isNull():
+            return None
+        self._audio_sink = QAudioSink(dev, fmt, self)
+        return self._audio_sink
+
+    def _start_jog(self) -> None:
+        if not self._pcm:
+            return
+        sink = self._ensure_audio_sink()
+        if sink is not None:
+            self._jog_io = sink.start()      # push mode: write PCM grains to this
+
+    def _jog_grain(self, ms: int) -> None:
+        """Play a short PCM window around ``ms`` so dragging is audible (shuttle)."""
+        if self._jog_io is None or not self._pcm or self._audio_sink is None:
+            return
+        win = int(0.05 * proxy.JOG_SR)                   # 50 ms grain
+        off = int((ms / 1000.0) * proxy.JOG_SR)
+        start = max(0, off * 2)
+        grain = self._pcm[start:start + win * 2]         # s16 = 2 bytes/sample
+        if grain and self._audio_sink.bytesFree() >= len(grain):
+            self._jog_io.write(grain)
+
+    def _stop_jog(self) -> None:
+        if self._audio_sink is not None:
+            self._audio_sink.stop()
+        self._jog_io = None
+
+    def closeEvent(self, e) -> None:
+        self._stop_jog()
+        if self._player is not None:
+            self._player.stop()
+        # We may be riding along on the main window's prewarm worker (which we do
+        # not own) — drop our connections so it can't call back into a closed dialog.
+        if self._prewarm_worker is not None:
+            for sig, slot in ((self._prewarm_worker.sig_ready, self._on_proxy_ready),
+                              (self._prewarm_worker.sig_progress, self._on_proxy_progress)):
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        if self._proxy_worker is not None and self._proxy_worker.isRunning():
+            self._proxy_worker.wait(2000)
+        super().closeEvent(e)
 
     def _clear(self) -> None:
         self.regions.clear()

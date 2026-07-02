@@ -170,6 +170,8 @@ class TimedRegion:
         where it is stable, re-inpaint when the surrounding background moves.
       * ``"text"``   — subtitles / captions: detect the text (Apple Vision) and erase
         only the glyph strokes, keeping the background between/inside letters.
+      * ``"caption"`` — stylized / karaoke / low-contrast subtitles Apple Vision cannot
+        read: an OCR-free mask covers the whole text (by image structure) inside the box.
       * ``"static"`` — occluder over a *static* background: inpaint once (or capture the
         real background from a gap frame) and freeze that plate for every frame — fastest
         and flicker-free, but leaves a "sticker" if the background actually moves.
@@ -196,6 +198,9 @@ class RemovalConfig:
     # reuse-first acceleration for "object" regions: reuse the background plate across
     # frames where it is stable instead of re-running LaMa every frame (neural tiers)
     reuse: bool = True
+    # decode the inpaint source from a cached full-res H.264 master (≈10× faster than
+    # the AV1 original) when one is available; off = read the pristine original
+    use_master: bool = True
 
     def timed_regions(self) -> list:
         """Unified TimedRegion list: new-style timed regions plus the legacy untimed
