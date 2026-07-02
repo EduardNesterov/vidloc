@@ -40,7 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import cv2
 import numpy as np
@@ -126,7 +126,22 @@ def main() -> int:
     ap.add_argument("--reuse-keyint", type=int, default=120)  # force LaMa every N reuses (0=never)
     # per-region kind selects the path: "object" (box + reuse) vs "text" (Vision glyphs).
     ap.add_argument("--text-dilate", type=int, default=4)  # px grown around detected text
+    # Vision text-detection tuning (defaults cover our EN/RU/IT->UA content):
+    ap.add_argument("--text-langs", default="uk-UA,ru-RU,it-IT,en-US")  # recognition scripts
+    ap.add_argument("--text-revision", type=int, default=3)  # Vision recognizer model (3=newest)
+    ap.add_argument("--text-min-height", type=float, default=0.0)  # min text height (frac 0..1)
+    ap.add_argument("--text-se-frac", type=float, default=0.5)  # glyph-mask kernel (frac of box h)
+    ap.add_argument("--text-grow", type=float, default=0.05)  # dilate glyph edge/outline (frac h)
+    ap.add_argument("--text-color", type=int, default=1)  # 1 = segment over L*a*b* (colored text)
+    ap.add_argument("--text-window", type=int, default=2)  # temporal union radius (±N frames)
+    # "caption" kind: OCR-free full-text mask for stylized/karaoke subs Vision can't read
+    ap.add_argument("--caption-se-frac", type=float, default=0.30)  # stroke kernel (frac box h)
+    ap.add_argument("--caption-close", type=float, default=0.08)   # merge strokes -> word blobs
+    ap.add_argument("--caption-grow", type=float, default=0.06)    # dilate glyph edge/outline
+    ap.add_argument("--caption-window", type=int, default=6)  # temporal union radius (±N frames)
+    ap.add_argument("--caption-contrast", type=float, default=0.28)  # local-adaptive channel (0=off)
     a = ap.parse_args()
+    text_langs = [s.strip() for s in a.text_langs.split(",") if s.strip()]
 
     dev = "mps" if torch.backends.mps.is_available() else "cpu"
     model = torch.jit.load(a.model, map_location=dev).eval()
@@ -134,9 +149,11 @@ def main() -> int:
     regions_spec = json.loads(a.regions)   # [{"box":[mx,my,mw,mh],"intervals":[[t0,t1],..]}]
     venc = json.loads(a.venc)
     n_text = sum(1 for s in regions_spec if s.get("kind") == "text")
+    n_caption = sum(1 for s in regions_spec if s.get("kind") == "caption")
     print(f"WORKER lama in-memory {cw}x{ch} scale={a.scale} batch={a.batch} "
-          f"regions={len(regions_spec)} (text={n_text}) reuse={a.reuse} dev={dev}", flush=True)
-    if n_text and not vision_text.available():
+          f"regions={len(regions_spec)} (text={n_text} caption={n_caption}) "
+          f"reuse={a.reuse} dev={dev}", flush=True)
+    if n_text and not vision_text.available():   # caption is OCR-free, needs no Vision
         print("ERROR: text regions need pyobjc (Vision) in .venv-inpaint", flush=True)
         return 1
 
@@ -196,6 +213,7 @@ def main() -> int:
             "seen": False,                         # is plate valid?
             "ref_ring": None,                      # numpy [n,3] ring at plate-capture time
             "reuse_run": 0,                        # consecutive reuses since last LaMa
+            "mhist": deque(),                      # text/caption: recent (global k, mask)
         })
 
     framesize = cw * ch * 3
@@ -237,7 +255,9 @@ def main() -> int:
         ty0, ty1, tx0, tx1 = r["tile"]
         tile_img = frame_u8[ty0:ty1, tx0:tx1]
         th, tw = ty1 - ty0, tx1 - tx0
-        boxes = vision_text.detect_text_boxes(tile_img)
+        boxes = vision_text.detect_text_boxes(
+            tile_img, languages=text_langs, revision=a.text_revision,
+            min_text_height=a.text_min_height)
         if not boxes:
             return None
         m = np.zeros((th, tw), np.float32)
@@ -247,10 +267,35 @@ def main() -> int:
             ix1, iy1 = min(dx + dw, bx1, tw), min(dy + dh, by1, th)
             if ix1 <= ix0 or iy1 <= iy0:
                 continue
-            gm = vision_text.glyph_mask(tile_img[iy0:iy1, ix0:ix1])
+            gm = vision_text.glyph_mask(tile_img[iy0:iy1, ix0:ix1], se_frac=a.text_se_frac,
+                                        grow_frac=a.text_grow, color=bool(a.text_color))
             m[iy0:iy1, ix0:ix1] = np.maximum(m[iy0:iy1, ix0:ix1], gm.astype(np.float32))
         if m.sum() == 0:
             return None
+        if a.text_dilate > 0:
+            k = 2 * a.text_dilate + 1
+            m = cv2.dilate(m, np.ones((k, k), np.uint8))
+        return m
+
+    def caption_mask_tile(frame_u8, r):
+        """OCR-free full-text mask for a "caption" region (stylized / karaoke subtitles
+        Vision cannot read). Segments the whole text inside the user box by image
+        structure — no detection. Returns [th,tw] float or None."""
+        mx, my, mw, mh = r["box"]
+        ty0, ty1, tx0, tx1 = r["tile"]
+        tile_img = frame_u8[ty0:ty1, tx0:tx1]
+        th, tw = ty1 - ty0, tx1 - tx0
+        bx0, by0 = max(mx - tx0, 0), max(my - ty0, 0)
+        bx1, by1 = min(mx + mw - tx0, tw), min(my + mh - ty0, th)
+        if bx1 <= bx0 or by1 <= by0:
+            return None
+        cm = vision_text.caption_mask(tile_img[by0:by1, bx0:bx1], se_frac=a.caption_se_frac,
+                                      close_frac=a.caption_close, grow_frac=a.caption_grow,
+                                      color=bool(a.text_color), contrast_k=a.caption_contrast)
+        if cm.sum() == 0:
+            return None
+        m = np.zeros((th, tw), np.float32)
+        m[by0:by1, bx0:bx1] = cm.astype(np.float32)
         if a.text_dilate > 0:
             k = 2 * a.text_dilate + 1
             m = cv2.dilate(m, np.ones((k, k), np.uint8))
@@ -286,7 +331,8 @@ def main() -> int:
         nonlocal gpu_frames, lama_reg, reuse_reg
         b = len(frames_u8)
         obj_jobs = defaultdict(list)      # object region id -> [frame k] (static box mask)
-        txt_jobs = defaultdict(list)      # text region id -> [(frame k, tile mask)]
+        txt_jobs = defaultdict(list)      # text region id -> [(frame k, tile mask)] (unioned)
+        txt_raw = defaultdict(dict)       # text region id -> {frame k: raw mask or None}
         reg = {}
 
         for k in range(b):
@@ -298,7 +344,7 @@ def main() -> int:
             # object/static regions: grab a real plate wherever the box is visible now
             # (a gap frame gives the true background -> zero LaMa when it reappears).
             for r, on in zip(regions, acts):
-                if on or not r["lama_ok"] or r["kind"] == "text":
+                if on or not r["lama_ok"] or r["kind"] in ("text", "caption"):
                     continue
                 if r["kind"] == "object" and not a.reuse:
                     continue                                  # object reuse disabled globally
@@ -312,11 +358,10 @@ def main() -> int:
             for r, on in zip(regions, acts):
                 if not on or not r["lama_ok"]:
                     continue
-                if r["kind"] == "text":                       # detect + queue glyph mask
-                    tm = text_mask_tile(frames_u8[k], r)
-                    if tm is not None:
-                        txt_jobs[id(r)].append((k, tm))
-                        reg[id(r)] = r
+                if r["kind"] in ("text", "caption"):          # per-frame mask (union later)
+                    mkfn = caption_mask_tile if r["kind"] == "caption" else text_mask_tile
+                    txt_raw[id(r)][k] = mkfn(frames_u8[k], r)
+                    reg[id(r)] = r
                     continue
                 # object/static: reuse the plate if valid, else send the box to LaMa
                 y0, y1, x0, x1 = r["bb"]
@@ -338,6 +383,29 @@ def main() -> int:
                     obj_jobs[id(r)].append(k)
                     reg[id(r)] = r
             out[k] = res
+
+        # temporal union: OR each active frame's mask with its neighbours within ±window
+        # frames, so a word the detector missed (or that is faint) on a single frame is
+        # still erased. Persisted across batches (r["mhist"]) — backward reach spans earlier
+        # batches, forward reach is within this batch (no lookahead). caption uses a wider
+        # window than text (karaoke lines persist, so a word seen recently is still there).
+        for rid, per_k in txt_raw.items():
+            r = reg[rid]
+            hist = r["mhist"]
+            win = a.caption_window if r["kind"] == "caption" else a.text_window
+            while hist and hist[0][0] < base - win:        # drop masks out of reach
+                hist.popleft()
+            for k, mk in per_k.items():                    # add this batch's masks to history
+                if mk is not None:
+                    hist.append((base + k, mk))
+            for k in per_k:
+                gk = base + k
+                acc = None
+                for g, mk in hist:
+                    if abs(g - gk) <= win:
+                        acc = mk if acc is None else np.maximum(acc, mk)
+                if acc is not None and acc.sum() > 0:
+                    txt_jobs[rid].append((k, acc))
 
         touched = set()
         # object LaMa: static box mask per region tile, composite + reseed the plate
