@@ -130,7 +130,10 @@ def video_encoder_args(output=None, crf=None, codec=None) -> List[str]:
             a += ["-tag:v", "hvc1"]
         return a
     enc = "libx265" if is265 else "libx264"
-    a = ["-c:v", enc, "-crf", str(crf), "-preset", "medium", "-pix_fmt", "yuv420p"]
+    # `veryfast` is ~2x faster than `medium` on M2 with better size than VideoToolbox
+    # (see benchmarks) — a much better default for re-encoding than the old `medium`.
+    preset = getattr(output, "preset", "veryfast") if output else "veryfast"
+    a = ["-c:v", enc, "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p"]
     if is265:
         a += ["-tag:v", "hvc1"]
     return a
@@ -198,7 +201,17 @@ def render_video(src: str, out: str, output: OutputConfig, *,
         args += ["-map", f"{sub_idx}:0"]
 
     # ---- video codec -------------------------------------------------- #
-    if output.codec == VideoCodec.KEEP and not vfilter and not use_complex:
+    # If nothing transforms the video (no scale / burn-in / fps change) and the source
+    # already carries the target codec, stream-copy instead of re-encoding. This makes a
+    # removal-only job (cleaned.mp4 is already H.264) a fast remux, not a 2nd full encode.
+    target_vc = "hevc" if output.codec == VideoCodec.H265 else "h264"
+    try:
+        src_vc = probe(src).v_codec
+    except Exception:  # noqa: BLE001
+        src_vc = ""
+    can_copy_v = (not vfilter and not use_complex and not output.fps
+                  and (output.codec == VideoCodec.KEEP or src_vc == target_vc))
+    if can_copy_v:
         args += ["-c:v", "copy"]
     else:
         args += video_encoder_args(output)

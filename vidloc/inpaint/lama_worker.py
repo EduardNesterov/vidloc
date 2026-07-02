@@ -124,8 +124,7 @@ def main() -> int:
     ap.add_argument("--reuse-pad", type=int, default=6)    # ring band width (px, full-res)
     ap.add_argument("--reuse-gap", type=int, default=2)    # ring inset from the box edge (px)
     ap.add_argument("--reuse-keyint", type=int, default=120)  # force LaMa every N reuses (0=never)
-    # text mode: detect text inside each box (Apple Vision) and erase only the glyphs
-    ap.add_argument("--text", type=int, default=0)         # 1 = detect+mask text per frame
+    # per-region kind selects the path: "object" (box + reuse) vs "text" (Vision glyphs).
     ap.add_argument("--text-dilate", type=int, default=4)  # px grown around detected text
     a = ap.parse_args()
 
@@ -134,10 +133,11 @@ def main() -> int:
     cw, ch = a.cw, a.ch
     regions_spec = json.loads(a.regions)   # [{"box":[mx,my,mw,mh],"intervals":[[t0,t1],..]}]
     venc = json.loads(a.venc)
+    n_text = sum(1 for s in regions_spec if s.get("kind") == "text")
     print(f"WORKER lama in-memory {cw}x{ch} scale={a.scale} batch={a.batch} "
-          f"regions={len(regions_spec)} reuse={a.reuse} text={a.text} dev={dev}", flush=True)
-    if a.text and not vision_text.available():
-        print("ERROR: text mode needs pyobjc (Vision) in .venv-inpaint", flush=True)
+          f"regions={len(regions_spec)} (text={n_text}) reuse={a.reuse} dev={dev}", flush=True)
+    if n_text and not vision_text.available():
+        print("ERROR: text regions need pyobjc (Vision) in .venv-inpaint", flush=True)
         return 1
 
     iw = max(8, round(cw / a.scale))
@@ -181,6 +181,7 @@ def main() -> int:
             mp_tile = None
         regions.append({
             "intervals": [tuple(iv) for iv in spec.get("intervals", [])],
+            "kind": spec.get("kind", "object"),    # "object" (box+reuse) | "text" (Vision glyphs)
             "box": (mx, my, mw, mh),               # raw user box (crop-local)
             "bb": (y0, y1, x0, x1),                # crop-local bounding box
             "fe_loc": fe_np[y0:y1, x0:x1, None].copy(),   # [bh,bw,1] composite weight
@@ -275,11 +276,18 @@ def main() -> int:
         predf = F.interpolate(pred, (ty1 - ty0, tx1 - tx0), mode="bilinear", align_corners=False)
         return predf.clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy()
 
-    def flush_reuse(frames_u8, ff, out, base):
-        """Static-box reuse path: plate reuse + per-region tile LaMa (fills ``out``)."""
+    def flush_regions(frames_u8, ff, out, base):
+        """Single pass, each region handled by its ``kind``:
+          * "object" — whole box + background-plate reuse (run_region_lama on a static
+            box mask); reuse skips LaMa on frames where the surrounding ring is stable.
+          * "text"   — Vision detects the text; erase only the glyph strokes per frame
+            (run_region_lama_masks on per-frame masks). Reuse does not apply.
+        Both kinds can coexist in one frame; they composite into the same ``out``."""
         nonlocal gpu_frames, lama_reg, reuse_reg
         b = len(frames_u8)
-        pending = {}   # frame idx -> [regions needing LaMa this frame]
+        obj_jobs = defaultdict(list)      # object region id -> [frame k] (static box mask)
+        txt_jobs = defaultdict(list)      # text region id -> [(frame k, tile mask)]
+        reg = {}
 
         for k in range(b):
             t = (base + k) / a.fps
@@ -287,27 +295,35 @@ def main() -> int:
             res = cur.copy()
             acts = [_active(r["intervals"], t) for r in regions]
 
-            # 1) any region whose box is unmasked right now is truly visible ->
-            #    grab a real, drift-free plate for it (the key win for gated subtitles).
-            if a.reuse:
-                for r, on in zip(regions, acts):
-                    if on or not r["lama_ok"]:
-                        continue
-                    y0, y1, x0, x1 = r["bb"]
-                    loc = cur[y0:y1, x0:x1]
-                    r["plate"] = loc.copy()
-                    r["ref_ring"] = loc[r["ring_loc"]].copy()
-                    r["seen"] = True
-                    r["reuse_run"] = 0
+            # object/static regions: grab a real plate wherever the box is visible now
+            # (a gap frame gives the true background -> zero LaMa when it reappears).
+            for r, on in zip(regions, acts):
+                if on or not r["lama_ok"] or r["kind"] == "text":
+                    continue
+                if r["kind"] == "object" and not a.reuse:
+                    continue                                  # object reuse disabled globally
+                y0, y1, x0, x1 = r["bb"]
+                loc = cur[y0:y1, x0:x1]
+                r["plate"] = loc.copy()
+                r["ref_ring"] = loc[r["ring_loc"]].copy()
+                r["seen"] = True
+                r["reuse_run"] = 0
 
-            # 2) decide per active region: reuse the plate or send to LaMa.
-            lama_regions = []
             for r, on in zip(regions, acts):
                 if not on or not r["lama_ok"]:
                     continue
+                if r["kind"] == "text":                       # detect + queue glyph mask
+                    tm = text_mask_tile(frames_u8[k], r)
+                    if tm is not None:
+                        txt_jobs[id(r)].append((k, tm))
+                        reg[id(r)] = r
+                    continue
+                # object/static: reuse the plate if valid, else send the box to LaMa
                 y0, y1, x0, x1 = r["bb"]
                 can_reuse = False
-                if a.reuse and r["seen"] and r["has_ring"]:
+                if r["kind"] == "static":
+                    can_reuse = r["seen"]                     # freeze: reuse forever once seeded
+                elif a.reuse and r["seen"] and r["has_ring"]:
                     forced = a.reuse_keyint > 0 and r["reuse_run"] >= a.reuse_keyint
                     if not forced:
                         loc = cur[y0:y1, x0:x1]
@@ -319,60 +335,30 @@ def main() -> int:
                     r["reuse_run"] += 1
                     reuse_reg += 1
                 else:
-                    lama_regions.append(r)
-
-            if lama_regions:
-                pending[k] = lama_regions
-                gpu_frames += 1
-                lama_reg += len(lama_regions)
+                    obj_jobs[id(r)].append(k)
+                    reg[id(r)] = r
             out[k] = res
 
-        # 3) run LaMa grouped by region — one batched model call per region over the
-        #    frames that need it (small tiles) — then composite each box locally and
-        #    reseed the plate. Reuse regions live in other boxes and are untouched.
-        if pending:
-            jobs = defaultdict(list)      # region id -> [frame idx, ...] (ascending)
-            reg = {}
-            for k in pending:
-                for r in pending[k]:
-                    jobs[id(r)].append(k)
-                    reg[id(r)] = r
-            for rid, ks in jobs.items():
-                r = reg[rid]
-                preds = run_region_lama(r, ks, frames_u8)     # [n,th,tw,3]
-                y0, y1, x0, x1 = r["bb"]
-                by0, by1, bx0, bx1 = r["bb_in_tile"]
-                fe = r["fe_loc"]
-                for j, k in enumerate(ks):
-                    pbb = preds[j][by0:by1, bx0:bx1]           # prediction over the box
-                    patch = out[k][y0:y1, x0:x1] * (1 - fe) + pbb * fe
-                    out[k][y0:y1, x0:x1] = patch
-                    r["plate"] = patch.copy()                  # reseed: future reuse
-                    r["ref_ring"] = ff[k][y0:y1, x0:x1][r["ring_loc"]].copy()
-                    r["seen"] = True
-                    r["reuse_run"] = 0
-
-    def flush_text(frames_u8, ff, out, base):
-        """Text path: per active frame detect the text inside each box and erase only
-        the glyphs (tight per-frame mask). Reuse is bypassed — the mask is so small that
-        LaMa is cheap; batched per region with per-frame masks (fills ``out``)."""
-        nonlocal gpu_frames, lama_reg
-        b = len(frames_u8)
-        jobs = defaultdict(list)      # region id -> [(frame idx, tile mask)]
-        reg = {}
-        for k in range(b):
-            out[k] = ff[k].copy()
-            t = (base + k) / a.fps
-            for r in regions:
-                if not r["lama_ok"] or not _active(r["intervals"], t):
-                    continue
-                tm = text_mask_tile(frames_u8[k], r)
-                if tm is not None:
-                    jobs[id(r)].append((k, tm))
-                    reg[id(r)] = r
-
         touched = set()
-        for rid, items in jobs.items():
+        # object LaMa: static box mask per region tile, composite + reseed the plate
+        for rid, ks in obj_jobs.items():
+            r = reg[rid]
+            preds = run_region_lama(r, ks, frames_u8)         # [n,th,tw,3]
+            y0, y1, x0, x1 = r["bb"]
+            by0, by1, bx0, bx1 = r["bb_in_tile"]
+            fe = r["fe_loc"]
+            for j, k in enumerate(ks):
+                pbb = preds[j][by0:by1, bx0:bx1]
+                patch = out[k][y0:y1, x0:x1] * (1 - fe) + pbb * fe
+                out[k][y0:y1, x0:x1] = patch
+                r["plate"] = patch.copy()                     # reseed: future reuse
+                r["ref_ring"] = ff[k][y0:y1, x0:x1][r["ring_loc"]].copy()
+                r["seen"] = True
+                r["reuse_run"] = 0
+                lama_reg += 1
+                touched.add(k)
+        # text LaMa: per-frame glyph mask per region tile, composite only text pixels
+        for rid, items in txt_jobs.items():
             r = reg[rid]
             ks = [k for k, _ in items]
             preds = run_region_lama_masks(r, ks, [m for _, m in items], frames_u8)
@@ -389,7 +375,7 @@ def main() -> int:
         nonlocal done
         ff = [f.astype(np.float32) / 255.0 for f in frames_u8]   # [ch,cw,3] each
         out = [None] * len(frames_u8)
-        (flush_text if a.text else flush_reuse)(frames_u8, ff, out, base)
+        flush_regions(frames_u8, ff, out, base)
         stacked = np.clip(np.stack(out), 0, 1) * 255
         assert ff2.stdin is not None
         ff2.stdin.write(stacked.astype(np.uint8).tobytes())

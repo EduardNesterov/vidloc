@@ -16,6 +16,7 @@ from typing import Callable, List, Optional
 from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -404,8 +405,25 @@ class RegionEditor(QDialog):
         else:
             self.slider = None
 
+        sel_row = QHBoxLayout()
         self.lbl_sel = QLabel("")
-        lay.addWidget(self.lbl_sel)
+        self.cmb_kind = QComboBox()
+        self.cmb_kind.addItem("Об'єкт / лого (reuse фону)", "object")
+        self.cmb_kind.addItem("Текст / субтитри (Vision — лише літери)", "text")
+        self.cmb_kind.addItem("Статичний фон (затерти раз, заморозити)", "static")
+        self.cmb_kind.setToolTip(
+            "Тип обраної рамки. «Об'єкт»: затирає весь прямокутник, повторно використовує "
+            "фон і пере-затирає при русі фону. «Текст»: Apple Vision стирає лише літери, "
+            "зберігаючи фон між ними (субтитри/підписи). «Статичний фон»: затирає один раз "
+            "і вставляє на всі кадри без перевірки — найшвидше і без мерехтіння, але дасть "
+            "«наклейку», якщо фон за рамкою рухається (бери лише коли фон нерухомий).")
+        self.cmb_kind.currentIndexChanged.connect(self._on_kind_changed)
+        sel_row.addWidget(self.lbl_sel, 1)
+        sel_row.addWidget(QLabel("Тип рамки:"))
+        sel_row.addWidget(self.cmb_kind)
+        sel_wrap = QWidget()
+        sel_wrap.setLayout(sel_row)
+        lay.addWidget(sel_wrap)
         self.timeline = _Timeline()
         self.timeline.on_change = self._refresh
         self.timeline.on_scrub = self._on_timeline_scrub
@@ -434,10 +452,21 @@ class RegionEditor(QDialog):
             self.timeline.set_region(self.regions[i], self.duration or 1.0)
             n = len(self.regions[i].intervals)
             self.lbl_sel.setText(f"Відрізки рамки №{i + 1}: {n}  (порожньо = весь ролик)")
+            self.cmb_kind.blockSignals(True)
+            idx = self.cmb_kind.findData(self.regions[i].kind)
+            self.cmb_kind.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cmb_kind.setEnabled(True)
+            self.cmb_kind.blockSignals(False)
         else:
             self.timeline.set_region(None, self.duration or 1.0)
             self.lbl_sel.setText("Відрізки: оберіть рамку (клік по ній)")
+            self.cmb_kind.setEnabled(False)
         self.canvas.update()
+
+    def _on_kind_changed(self, _i: int) -> None:
+        i = self.canvas.selected
+        if 0 <= i < len(self.regions):
+            self.regions[i].kind = self.cmb_kind.currentData()
 
     def _on_timeline_scrub(self, t: float) -> None:
         if self.slider is not None:

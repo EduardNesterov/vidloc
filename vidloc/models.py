@@ -151,6 +151,7 @@ class OutputConfig:
     fps: Optional[float] = None      # None = keep source
     audio_bitrate: str = "192k"
     hw_encode: bool = False          # VideoToolbox hardware encoder (fast, slightly lower quality)
+    preset: str = "veryfast"         # libx264/5 preset (software encode speed↔size)
 
 
 class InpaintQuality(str, Enum):
@@ -162,9 +163,20 @@ class InpaintQuality(str, Enum):
 @dataclass
 class TimedRegion:
     """A normalized rectangle (x, y, w, h in 0..1) to erase, active only during
-    the given time intervals (seconds). Empty interval list = the whole video."""
+    the given time intervals (seconds). Empty interval list = the whole video.
+
+    ``kind`` picks the erase strategy (neural tiers):
+      * ``"object"`` — logo / graphic: fill the whole box, reuse the background plate
+        where it is stable, re-inpaint when the surrounding background moves.
+      * ``"text"``   — subtitles / captions: detect the text (Apple Vision) and erase
+        only the glyph strokes, keeping the background between/inside letters.
+      * ``"static"`` — occluder over a *static* background: inpaint once (or capture the
+        real background from a gap frame) and freeze that plate for every frame — fastest
+        and flicker-free, but leaves a "sticker" if the background actually moves.
+    """
     rect: tuple
     intervals: list = field(default_factory=list)  # [(start, end), ...] in seconds
+    kind: str = "object"
 
     def active_at(self, t: float) -> bool:
         return (not self.intervals) or any(t0 <= t <= t1 for (t0, t1) in self.intervals)
@@ -181,21 +193,20 @@ class RemovalConfig:
     quality: InpaintQuality = InpaintQuality.BALANCED
     # new-style per-region time-gated removal: list[TimedRegion]
     regions: list = field(default_factory=list)
-    # reuse-first acceleration: reuse the background plate across frames where it
-    # is stable instead of re-running LaMa every frame (neural tiers only)
+    # reuse-first acceleration for "object" regions: reuse the background plate across
+    # frames where it is stable instead of re-running LaMa every frame (neural tiers)
     reuse: bool = True
-    # erase only the detected text (Apple Vision) inside each box, keeping the
-    # background between/inside the letters (neural tiers only; bypasses reuse)
-    text_only: bool = False
 
     def timed_regions(self) -> list:
-        """Unified TimedRegion list: new-style timed regions plus the legacy
-        untimed watermark / hardsub rects (treated as whole-video)."""
+        """Unified TimedRegion list: new-style timed regions plus the legacy untimed
+        watermark / hardsub rects (whole-video). Legacy watermarks are ``object``;
+        the hardsub band is ``text``."""
         out = [r for r in self.regions if isinstance(r, TimedRegion)]
         if self.remove_watermark:
-            out += [TimedRegion(rect=tuple(r)) for r in self.watermark_regions if r]
+            out += [TimedRegion(rect=tuple(r), kind="object")
+                    for r in self.watermark_regions if r]
         if self.remove_hardsubs and self.hardsub_region:
-            out.append(TimedRegion(rect=tuple(self.hardsub_region)))
+            out.append(TimedRegion(rect=tuple(self.hardsub_region), kind="text"))
         return out
 
 

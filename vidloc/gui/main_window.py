@@ -224,21 +224,24 @@ class MainWindow(QMainWindow):
             ("Швидко (delogo) — грубо", "fast"),
         ])
 
-        self.chk_reuse = QCheckBox("Прискорення reuse-first (повторне використання фону)")
+        # encoder speed for the removal output (data = (libx264 preset, hardware VT?))
+        self.cmb_enc = _combo([
+            ("Швидко (x264 veryfast) — реком.", ("veryfast", False)),
+            ("Якісно (x264 medium) — повільно", ("medium", False)),
+            ("Апаратно (VideoToolbox) — швидко, більший файл", ("veryfast", True)),
+        ])
+        self.cmb_enc.setToolTip(
+            "Кодування результату затирання. «Швидко (veryfast)» — приблизно вдвічі швидше "
+            "за medium і навіть краще стискає, ніж апаратний; рекомендовано. «Апаратно "
+            "(VideoToolbox)» — медіа-рушій M2, теж швидко, але файл більший.")
+
+        self.chk_reuse = QCheckBox("Прискорення reuse-first (для рамок типу «Об'єкт/лого»)")
         self.chk_reuse.setChecked(True)
         self.chk_reuse.setToolTip(
-            "Затирає LaMa лише там, де фон змінився, а на стабільних кадрах повторно "
-            "використовує вже очищений фон. Кратно швидше, особливо для статичного лого "
-            "та субтитрів із паузами. Стосується лише нейро-режимів.")
-
-        self.chk_text = QCheckBox("Затирати лише текст у рамці (нейро, Apple Vision)")
-        self.chk_text.setChecked(False)
-        self.chk_text.setToolTip(
-            "У межах рамки знаходить сам текст (Apple Vision, Neural Engine) і затирає "
-            "тільки літери, зберігаючи фон між/усередині них. Краще для тексту на "
-            "детальному фоні. Працює покадрово; reuse у цьому режимі не застосовується.")
-        # text mode and reuse are mutually exclusive (text detects per frame)
-        self.chk_text.toggled.connect(lambda on: self.chk_reuse.setEnabled(not on))
+            "Для рамок типу «Об'єкт/лого»: затирає LaMa лише там, де фон змінився, а на "
+            "стабільних кадрах повторно використовує вже очищений фон. Кратно швидше на "
+            "статичному лого та субтитрах із паузами. Тип рамки задається у редакторі "
+            "областей; для рамок «Текст» reuse не застосовується.")
 
         self.btn_regions = QPushButton("Області (декілька)…")
         self.btn_regions.clicked.connect(self._edit_regions)
@@ -256,9 +259,10 @@ class MainWindow(QMainWindow):
         form.addRow("Смуга субтитрів:", hs_wrap)
         form.addRow("Кілька областей:", reg_wrap)
         form.addRow("Якість затирання:", self.cmb_inpaint)
+        form.addRow("Кодування:", self.cmb_enc)
         form.addRow(self.chk_reuse)
-        form.addRow(self.chk_text)
-        note = QLabel("Виділення доступне після вибору відео. Нейро-режим на M2 "
+        note = QLabel("Виділення доступне після вибору відео. Тип кожної рамки (об'єкт "
+                      "або текст) задається в редакторі областей. Нейро-режим на M2 "
                       "повільний (хвилини на ролик).")
         note.setWordWrap(True)
         note.setStyleSheet("color: gray;")
@@ -731,11 +735,9 @@ class MainWindow(QMainWindow):
     def _on_removal_toggled(self, on: bool) -> None:
         """Master toggle: grey out / re-enable the whole removal block."""
         for w in (self.chk_wm, self.btn_wm, self.lbl_wm, self.chk_hs, self.btn_hs,
-                  self.lbl_hs, self.cmb_inpaint, self.chk_reuse, self.chk_text,
+                  self.lbl_hs, self.cmb_inpaint, self.cmb_enc, self.chk_reuse,
                   self.btn_inpaint, self.btn_skip_removal, self.btn_regions):
             w.setEnabled(on)
-        if on:                       # reuse is bypassed while text mode is active
-            self.chk_reuse.setEnabled(not self.chk_text.isChecked())
 
     def _edit_regions(self) -> None:
         """Open the region + time editor; regions persist on the window state."""
@@ -955,6 +957,7 @@ class MainWindow(QMainWindow):
             subprocess.run(["open", "-R", path], check=False)
 
     def _build_job(self) -> JobConfig:
+        enc_preset, enc_hw = self.cmb_enc.currentData()   # encoding chosen at the removal step
         out = OutputConfig(
             container=Container(self.cmb_container.currentData()),
             codec=VideoCodec(self.cmb_codec.currentData()),
@@ -962,7 +965,8 @@ class MainWindow(QMainWindow):
             crf=self.sld_crf.value(),
             fps=(self.cmb_fps.currentData() or None),
             audio_bitrate=self.cmb_abr.currentData(),
-            hw_encode=self.chk_hw.isChecked(),
+            hw_encode=enc_hw or self.chk_hw.isChecked(),
+            preset=enc_preset,
         )
         style = SubtitleStyle(
             font=self.cmb_subfont.currentData(),
@@ -997,7 +1001,6 @@ class MainWindow(QMainWindow):
             quality=InpaintQuality(self.cmb_inpaint.currentData()),
             regions=list(self._regions) if do_rm else [],
             reuse=self.chk_reuse.isChecked(),
-            text_only=self.chk_text.isChecked(),
         )
         return JobConfig(input_path=self.input_path,
                          output_path=self.ed_out.text(),

@@ -40,8 +40,7 @@ def _ensure_model(log) -> None:
 
 def lama_video(src, out, regions, info, output=None, scale: int = 2,
                reporter=None, on_progress=None, reuse: bool = True,
-               reuse_thresh: float = 0.02, reuse_keyint: int = 120,
-               text_only: bool = False) -> str:
+               reuse_thresh: float = 0.02, reuse_keyint: int = 120) -> str:
     log = reporter.log if reporter else (lambda m: None)
     if not INPAINT_PY.exists():
         raise RuntimeError("Середовище інпейнту (.venv-inpaint) не знайдено.")
@@ -62,7 +61,8 @@ def lama_video(src, out, regions, info, output=None, scale: int = 2,
     # each region's box is relative to the crop; intervals stay in seconds
     worker_regions = [
         {"box": [bx - cx, by - cy, bw, bh],
-         "intervals": [[float(t0), float(t1)] for (t0, t1) in r.intervals]}
+         "intervals": [[float(t0), float(t1)] for (t0, t1) in r.intervals],
+         "kind": getattr(r, "kind", "object")}
         for r, (bx, by, bw, bh) in zip(regions, px)
     ]
 
@@ -78,8 +78,7 @@ def lama_video(src, out, regions, info, output=None, scale: int = 2,
            "--fps", str(fps), "--scale", str(scale), "--batch", "8",
            "--total", str(total), "--venc", json.dumps(venc),
            "--reuse", "1" if reuse else "0",
-           "--reuse-thresh", str(reuse_thresh), "--reuse-keyint", str(reuse_keyint),
-           "--text", "1" if text_only else "0"]
+           "--reuse-thresh", str(reuse_thresh), "--reuse-keyint", str(reuse_keyint)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     assert proc.stdout is not None
