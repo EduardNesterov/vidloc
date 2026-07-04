@@ -94,7 +94,6 @@ class MainWindow(QMainWindow):
         self._can_start = False           # main «Старт» unlocked only after removal step
         self._removal_run = False         # a removal-only job is currently in flight
         self._clean_output = ""           # last produced watermark-free video
-        self._wm_regions: list = []
         self._hs_region = None
         self._regions: list = []          # multi-region editor: normalized (x,y,w,h) rects
         self._build_ui()
@@ -198,19 +197,8 @@ class MainWindow(QMainWindow):
         self.chk_do_removal.toggled.connect(self._on_removal_toggled)
         form.addRow(self.chk_do_removal)
 
-        self.chk_wm = QCheckBox("Прибрати водяні знаки")
-        self.btn_wm = QPushButton("Виділити область…")
-        self.btn_wm.clicked.connect(self._select_wm_region)
-        self.lbl_wm = QLabel("не виділено")
-        self.lbl_wm.setStyleSheet("color: gray;")
-        wm_row = QHBoxLayout()
-        wm_row.addWidget(self.btn_wm)
-        wm_row.addWidget(self.lbl_wm, 1)
-        wm_wrap = QWidget()
-        wm_wrap.setLayout(wm_row)
-
-        self.chk_hs = QCheckBox("Прибрати вшиті субтитри")
-        self.btn_hs = QPushButton("Виділити смугу субтитрів…")
+        self.chk_hs = QCheckBox("Прибрати вшиті субтитри/вотермарки")
+        self.btn_hs = QPushButton("Виділити область…")
         self.btn_hs.clicked.connect(self._select_hs_region)
         self.lbl_hs = QLabel("не виділено")
         self.lbl_hs.setStyleSheet("color: gray;")
@@ -263,10 +251,8 @@ class MainWindow(QMainWindow):
         reg_wrap = QWidget()
         reg_wrap.setLayout(reg_row)
 
-        form.addRow(self.chk_wm)
-        form.addRow("Область вотермарки:", wm_wrap)
         form.addRow(self.chk_hs)
-        form.addRow("Смуга субтитрів:", hs_wrap)
+        form.addRow("Область:", hs_wrap)
         form.addRow("Кілька областей:", reg_wrap)
         form.addRow("Якість затирання:", self.cmb_inpaint)
         form.addRow("Кодування:", self.cmb_enc)
@@ -308,25 +294,12 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QPixmap
         return QPixmap(frame)
 
-    def _select_wm_region(self) -> None:
-        pix = self._preview_pixmap()
-        if pix is None:
-            return
-        from .region_selector import RegionSelector
-        dlg = RegionSelector(pix, self, "Виділіть водяний знак")
-        if dlg.exec():
-            self._wm_regions = dlg.regions()
-            self.lbl_wm.setText(f"виділено рамок: {len(self._wm_regions)}"
-                                if self._wm_regions else "не виділено")
-            if self._wm_regions:
-                self.chk_wm.setChecked(True)
-
     def _select_hs_region(self) -> None:
         pix = self._preview_pixmap()
         if pix is None:
             return
         from .region_selector import RegionSelector
-        dlg = RegionSelector(pix, self, "Виділіть смугу субтитрів")
+        dlg = RegionSelector(pix, self, "Виділіть смугу субтитрів / вотермарку")
         if dlg.exec():
             regs = dlg.regions()
             self._hs_region = regs[0] if regs else None
@@ -770,9 +743,8 @@ class MainWindow(QMainWindow):
     # -- removal step ---------------------------------------------------- #
     def _on_removal_toggled(self, on: bool) -> None:
         """Master toggle: grey out / re-enable the whole removal block."""
-        for w in (self.chk_wm, self.btn_wm, self.lbl_wm, self.chk_hs, self.btn_hs,
-                  self.lbl_hs, self.cmb_inpaint, self.cmb_enc, self.chk_reuse,
-                  self.chk_master,
+        for w in (self.chk_hs, self.btn_hs, self.lbl_hs, self.cmb_inpaint, self.cmb_enc,
+                  self.chk_reuse, self.chk_master,
                   self.btn_inpaint, self.btn_skip_removal, self.btn_regions):
             w.setEnabled(on)
 
@@ -812,9 +784,8 @@ class MainWindow(QMainWindow):
         if not self.input_path or not os.path.exists(self.input_path):
             QMessageBox.warning(self, "Немає файлу", "Спочатку оберіть вхідне відео.")
             return
-        wm = self.chk_wm.isChecked() and bool(self._wm_regions)
         hs = self.chk_hs.isChecked() and self._hs_region is not None
-        if not (wm or hs or self._regions):
+        if not (hs or self._regions):
             QMessageBox.information(
                 self, "Видалення",
                 "Позначте, що прибирати, і виділіть область на відео.")
@@ -1033,8 +1004,6 @@ class MainWindow(QMainWindow):
         )
         do_rm = self.chk_do_removal.isChecked()
         rm = RemovalConfig(
-            remove_watermark=do_rm and self.chk_wm.isChecked() and bool(self._wm_regions),
-            watermark_regions=list(self._wm_regions),
             remove_hardsubs=do_rm and self.chk_hs.isChecked() and self._hs_region is not None,
             hardsub_region=self._hs_region,
             quality=InpaintQuality(self.cmb_inpaint.currentData()),

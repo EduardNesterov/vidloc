@@ -21,6 +21,7 @@ INPAINT_PY = settings.ROOT / ".venv-inpaint" / "bin" / "python"
 WORKER = Path(__file__).parent / "lama_worker.py"
 MODEL = settings.MODELS_DIR / "inpaint" / "torch" / "hub" / "checkpoints" / "big-lama.pt"
 MODEL_URL = "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
+CRAFT_MODEL = settings.MODELS_DIR / "craft" / "craft.onnx"   # "text" kind detector
 PAD = 48
 
 
@@ -66,6 +67,11 @@ def lama_video(src, out, regions, info, output=None, scale: int = 2,
         for r, (bx, by, bw, bh) in zip(regions, px)
     ]
 
+    if any(wr["kind"] == "text" for wr in worker_regions) and not CRAFT_MODEL.exists():
+        raise RuntimeError(
+            f"Рамки типу «Текст» потребують CRAFT-модель: {CRAFT_MODEL} не знайдено. "
+            "Згенеруй її: scripts/export_craft_onnx.py (див. докстрінг).")
+
     venc = video_encoder_args(output, crf=16, codec=VideoCodec.H264)
     total = max(1, round(info.duration * fps))
     log(f"Нейро-затирання {cw}×{ch} (масштаб ÷{scale}), {len(regions)} обл., "
@@ -78,7 +84,8 @@ def lama_video(src, out, regions, info, output=None, scale: int = 2,
            "--fps", str(fps), "--scale", str(scale), "--batch", "8",
            "--total", str(total), "--venc", json.dumps(venc),
            "--reuse", "1" if reuse else "0",
-           "--reuse-thresh", str(reuse_thresh), "--reuse-keyint", str(reuse_keyint)]
+           "--reuse-thresh", str(reuse_thresh), "--reuse-keyint", str(reuse_keyint),
+           "--craft-model", str(CRAFT_MODEL)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
     assert proc.stdout is not None

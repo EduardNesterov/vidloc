@@ -168,10 +168,8 @@ class TimedRegion:
     ``kind`` picks the erase strategy (neural tiers):
       * ``"object"`` — logo / graphic: fill the whole box, reuse the background plate
         where it is stable, re-inpaint when the surrounding background moves.
-      * ``"text"``   — subtitles / captions: detect the text (Apple Vision) and erase
-        only the glyph strokes, keeping the background between/inside letters.
-      * ``"caption"`` — stylized / karaoke / low-contrast subtitles Apple Vision cannot
-        read: an OCR-free mask covers the whole text (by image structure) inside the box.
+      * ``"text"``   — subtitles / captions: a neural detector (CRAFT, ONNX+CoreML) finds
+        the text inside the box and covers it; robust on stylized / low-contrast / Cyrillic.
       * ``"static"`` — occluder over a *static* background: inpaint once (or capture the
         real background from a gap frame) and freeze that plate for every frame — fastest
         and flicker-free, but leaves a "sticker" if the background actually moves.
