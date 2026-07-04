@@ -17,6 +17,7 @@ from .. import settings
 from ..media import ffmpeg
 from ..models import (
     ASR_MODEL,
+    DRAGOMAN_TRANSLATE_MODEL,
     LLM_TRANSLATE_MODEL,
     TRANSLATE_MODEL,
     JobConfig,
@@ -135,7 +136,26 @@ class PipelineRunner:
         if (job.needs_subtitles or job.needs_dubbing) and segments:
             t.start("translate", "Переклад на українську…")
             tq = job.translate.translate_quality
-            if tq == TranslateQuality.NATURAL:
+            if tq == TranslateQuality.DRAGOMAN:
+                if detected_lang == "en":
+                    r.log(f"Переклад: Dragoman EN→UK ({DRAGOMAN_TRANSLATE_MODEL})")
+                    try:
+                        from ..translate import dragoman
+                        segments = dragoman.translate_segments(
+                            segments, detected_lang, on_progress=lambda f: t.sub(f))
+                    except Exception as exc:  # noqa: BLE001
+                        r.log(f"⚠ Dragoman недоступний ({exc}); відкочуюсь на Aya.")
+                        from ..translate import llm
+                        segments = llm.translate_segments(
+                            segments, detected_lang, on_progress=lambda f: t.sub(f),
+                            extra_context=job.source_context)
+                else:
+                    r.log(f"Dragoman підтримує лише EN→UK; мова «{detected_lang}» → Aya.")
+                    from ..translate import llm
+                    segments = llm.translate_segments(
+                        segments, detected_lang, on_progress=lambda f: t.sub(f),
+                        extra_context=job.source_context)
+            elif tq == TranslateQuality.NATURAL:
                 r.log(f"Переклад: локальна LLM ({LLM_TRANSLATE_MODEL})")
                 try:
                     from ..translate import llm

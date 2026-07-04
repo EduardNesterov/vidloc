@@ -5,8 +5,10 @@ This module runs in the MAIN venv. The TTS models run in isolated venvs via
 worker scripts invoked as subprocesses, so their (older / conflicting)
 dependencies never touch the core environment:
 
+  * STYLETTS2 -> StyleTTS2-Ukrainian     in ``.venv-styletts2`` via ``styletts2_worker.py``
   * UKTTS    -> ukrainian-tts (5 voices)  in ``.venv-uktts`` via ``uktts_worker.py``
   * COQUI_UK -> Coqui uk/mai/vits         in ``.venv-tts``   via ``coqui_worker.py``
+  * F5_UK    -> F5-TTS voice clone        in ``.venv-f5``    via ``f5_worker.py``
 """
 
 from __future__ import annotations
@@ -26,6 +28,11 @@ _HERE = Path(__file__).parent
 
 def _engine_table() -> Dict[TTSEngine, dict]:
     return {
+        TTSEngine.STYLETTS2_UK: {
+            "python": settings.ROOT / ".venv-styletts2" / "bin" / "python",
+            "worker": _HERE / "styletts2_worker.py",
+            "cwd": settings.MODELS_DIR / "styletts2",
+        },
         TTSEngine.UKTTS: {
             "python": settings.ROOT / ".venv-uktts" / "bin" / "python",
             "worker": _HERE / "uktts_worker.py",
@@ -41,6 +48,11 @@ def _engine_table() -> Dict[TTSEngine, dict]:
             "python": settings.ROOT / ".venv-tts" / "bin" / "python",
             "worker": _HERE / "coqui_worker.py",
             "cwd": settings.MODELS_DIR / "tts",
+        },
+        TTSEngine.F5_UK: {
+            "python": settings.ROOT / ".venv-f5" / "bin" / "python",
+            "worker": _HERE / "f5_worker.py",
+            "cwd": settings.MODELS_DIR / "f5",
         },
     }
 
@@ -67,12 +79,34 @@ def _resolve_engine(job):
             return eng, info
     raise RuntimeError(
         "Жодне середовище озвучки не знайдено. Встановіть хоча б одне:\n"
+        "  StyleTTS2 UA: uv venv .venv-styletts2 --python 3.11 && "
+        "uv pip install --python .venv-styletts2/bin/python soundfile librosa scipy "
+        "einops einops_exts munch pyyaml torch torchaudio transformers 'numpy<2' "
+        "accelerate ctranslate2 sentencepiece huggingface-hub "
+        "git+https://github.com/patriotyk/ukrainian-word-stress.git "
+        "git+https://github.com/patriotyk/ipa-uk.git "
+        "git+https://github.com/patriotyk/styletts2-inference.git\n"
         "  ukrainian-tts: uv venv .venv-uktts --python 3.11 && "
-        "uv pip install --python .venv-uktts ukrainian-tts\n"
-        "  Coqui UA:      uv pip install --python .venv-tts coqui-tts torch torchaudio")
+        "uv pip install --python .venv-uktts/bin/python ukrainian-tts\n"
+        "  Piper UA:      uv venv .venv-piper --python 3.11 && "
+        "uv pip install --python .venv-piper/bin/python piper-tts onnxruntime "
+        "ukrainian-word-stress\n"
+        "  Coqui UA:      uv venv .venv-tts --python 3.11 && "
+        "uv pip install --python .venv-tts/bin/python coqui-tts torch torchaudio\n"
+        "  F5-TTS clone: uv venv .venv-f5 --python 3.11 && "
+        "uv pip install --python .venv-f5/bin/python f5-tts soundfile")
 
 
-def _make_spec(engine: TTSEngine, job, items: List[dict]) -> dict:
+def _make_spec(engine: TTSEngine, job, items: List[dict],
+               ref_audio: str = "", ref_text: str = "") -> dict:
+    if engine == TTSEngine.STYLETTS2_UK:
+        return {"backend": "styletts2_uk",
+                "model": "patriotyk/styletts2_ukrainian_multispeaker_hifigan",
+                "voices_repo": "patriotyk/styletts2-ukrainian",
+                "voice": _voice_id(job, engine),
+                "speed": 1.0,
+                "cache_dir": str(settings.MODELS_DIR / "styletts2"),
+                "items": items}
     if engine == TTSEngine.UKTTS:
         return {"backend": "uktts", "voice": _voice_id(job, engine),
                 "stress": "dictionary", "device": "cpu", "items": items}
@@ -81,6 +115,10 @@ def _make_spec(engine: TTSEngine, job, items: List[dict]) -> dict:
                                   / "uk_UA-ukrainian_tts-medium.onnx"),
                 "speaker_id": int(_voice_id(job, engine) or 0),
                 "length_scale": 1.0, "items": items}
+    if engine == TTSEngine.F5_UK:
+        return {"backend": "f5_uk", "model": "F5TTS_v1_Base",
+                "ref_audio": ref_audio, "ref_text": ref_text,
+                "device": "mps", "items": items}
     return {"backend": "coqui_uk", "model": "tts_models/uk/mai/vits",
             "tts_home": str(settings.MODELS_DIR / "tts"), "items": items}
 
@@ -115,6 +153,28 @@ def _fit_clip(src_wav: str, dst_wav: str, factor: float) -> None:
     _run(args)
 
 
+def _reference_wav(segments: List[Dict], job, work) -> tuple[str, str]:
+    """F5 prompt audio: explicit clone reference, or the first transcript segment."""
+    explicit = (getattr(job.translate, "tts_clone_reference", None) or "").strip()
+    if explicit:
+        return explicit, ""
+    cand = next((s for s in segments if (s.get("text") or "").strip()
+                 and float(s.get("end", 0)) > float(s.get("start", 0))), None)
+    if not cand:
+        return "", ""
+    start = max(0.0, float(cand["start"]))
+    dur = min(10.0, max(1.0, float(cand["end"]) - start))
+    out = str(Path(work) / "tts_ref.wav")
+    args = [settings.FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", str(start), "-t", str(dur), "-i", job.input_path,
+            "-vn", "-ar", "24000", "-ac", "1", out]
+    try:
+        _run(args)
+    except subprocess.CalledProcessError:
+        return "", ""
+    return out, (cand.get("text") or "").strip()
+
+
 def _surface(line: str) -> bool:
     """Decide whether a worker stdout line is worth showing in the GUI log."""
     if line.startswith("WORKER") or "error" in line.lower() or "Download" in line:
@@ -137,10 +197,16 @@ def synthesize_dub(segments: List[Dict], job, info, work, reporter=None,
 
     items = [
         {"text": (seg.get("text_tr") or seg.get("text") or ""),
+         "src_text": (seg.get("text") or ""),
          "out": str(tdir / f"seg_{i:04d}.wav")}
         for i, seg in enumerate(segments)
     ]
-    spec = _make_spec(engine, job, items)
+    ref_audio = ref_text = ""
+    if engine == TTSEngine.F5_UK:
+        ref_audio, ref_text = _reference_wav(segments, job, work)
+        if not ref_audio:
+            raise RuntimeError("F5-TTS потребує reference-аудіо, але його не вдалося витягти.")
+    spec = _make_spec(engine, job, items, ref_audio=ref_audio, ref_text=ref_text)
     spec_path = tdir / "spec.json"
     spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
 
@@ -148,6 +214,8 @@ def synthesize_dub(segments: List[Dict], job, info, work, reporter=None,
         voice_note = spec["voice"]
     elif "speaker_id" in spec:
         voice_note = f"#{spec['speaker_id']}"
+    elif "ref_audio" in spec:
+        voice_note = "клон з оригіналу"
     else:
         voice_note = "стандартний"
     log(f"Озвучення: {engine.value} / голос «{voice_note}» "
@@ -161,7 +229,6 @@ def synthesize_dub(segments: List[Dict], job, info, work, reporter=None,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         cwd=str(cwd) if cwd else None)
     assert proc.stdout is not None
-    n = len(items)
     for line in proc.stdout:
         line = line.strip()
         if line.startswith("PROGRESS"):

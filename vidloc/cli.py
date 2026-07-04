@@ -58,7 +58,7 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--subs", default="soft", choices=["soft", "burn"])
     p.add_argument("--asr", default="balanced", choices=[e.value for e in ASRQuality])
     p.add_argument("--mt", default="natural", choices=[e.value for e in TranslateQuality])
-    p.add_argument("--engine", default="", choices=["", "uktts", "piper", "coqui_uk"])
+    p.add_argument("--engine", default="", choices=[""] + [e.value for e in TTSEngine])
     p.add_argument("--voice", default="")
     p.add_argument("--tts-speed", type=float, default=1.0)
     p.add_argument("--beam", type=int, default=5)
@@ -94,7 +94,7 @@ def main(argv: Optional[list] = None) -> int:
             beam_size=a.beam,
             subtitle_placement=(SubtitlePlacement.BURN if a.subs == "burn"
                                 else SubtitlePlacement.SOFT),
-            tts_engine=TTSEngine(a.engine) if a.engine else TTSEngine.UKTTS,
+            tts_engine=TTSEngine(a.engine) if a.engine else TTSEngine.STYLETTS2_UK,
             tts_voice=a.voice,
             tts_speed=a.tts_speed,
         ),

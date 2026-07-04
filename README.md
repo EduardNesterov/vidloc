@@ -11,11 +11,11 @@ Everything runs **locally**, with no data sent to the cloud.
 | Done | Feature |
 |:---:|---|
 | ✅ | Speech recognition (Whisper, mlx — Metal acceleration) |
-| ✅ | Translation into Ukrainian (local LLM Aya / NLLB-200, Metal) |
+| ✅ | Translation into Ukrainian (local LLM Aya / Dragoman EN→UK / NLLB-200, Metal) |
 | ✅ | Subtitles: soft (separate track) or burned-in (hardsub) |
 | ✅ | Output: container (mp4/mkv/mov/webm), codec (H.264/H.265/copy), resolution, CRF, fps, audio bitrate |
 | ✅ | GUI with every setting + headless CLI |
-| 🚧 | Dubbing (Ukrainian voices: ukrainian-tts / Piper / Coqui) |
+| 🚧 | Dubbing (Ukrainian voices: StyleTTS2 / ukrainian-tts / Piper / Coqui / F5-TTS clone) |
 | 🚧 | Watermark removal (neural inpainting: LaMa / IOPaint) |
 | 🚧 | Burned-in subtitle removal (OCR + inpainting) |
 
@@ -36,6 +36,33 @@ uv sync          # creates .venv and installs dependencies
 binaries into `bin/` or install a system ffmpeg (`brew install ffmpeg`).
 Models are not in the repo either and download automatically on first run (`models/`, ~26 GB).
 
+### Optional isolated TTS environments
+
+TTS engines intentionally live outside the main `.venv` because their dependency stacks
+conflict. Install only the engines you plan to use:
+
+```sh
+uv venv .venv-styletts2 --python 3.11
+uv pip install --python .venv-styletts2/bin/python \
+  soundfile librosa scipy einops einops_exts munch pyyaml torch torchaudio \
+  transformers "numpy<2" accelerate ctranslate2 sentencepiece huggingface-hub \
+  git+https://github.com/patriotyk/ukrainian-word-stress.git \
+  git+https://github.com/patriotyk/ipa-uk.git \
+  git+https://github.com/patriotyk/styletts2-inference.git
+
+uv venv .venv-uktts --python 3.11
+uv pip install --python .venv-uktts/bin/python ukrainian-tts
+
+uv venv .venv-piper --python 3.11
+uv pip install --python .venv-piper/bin/python piper-tts onnxruntime ukrainian-word-stress
+
+uv venv .venv-tts --python 3.11
+uv pip install --python .venv-tts/bin/python coqui-tts torch torchaudio
+
+uv venv .venv-f5 --python 3.11
+uv pip install --python .venv-f5/bin/python f5-tts soundfile
+```
+
 ## Run
 
 GUI:
@@ -49,7 +76,8 @@ PYTHONPATH=. .venv/bin/python -m vidloc.cli input.mp4 \
     --source en --mode subtitles --subs soft --asr balanced --mt fast
 ```
 Flags: `--mode {subtitles,voice,both,none}`, `--subs {soft,burn}`,
-`--asr {fast,balanced,best}`, `--mt {fast,best}`, `--beam N`,
+`--asr {fast,balanced,best}`, `--mt {fast,best,natural,dragoman}`,
+`--engine {styletts2_uk,uktts,piper,coqui_uk,f5_uk}`, `--beam N`,
 `--height`, `--container`, `--codec`, `--crf`.
 
 ## Architecture
@@ -62,7 +90,7 @@ vidloc/
   models.py          job config: enums + JobConfig dataclass
   media/ffmpeg.py    ffmpeg wrappers (probe, extract_audio, render_video)
   asr/               speech recognition (mlx-whisper)
-  translate/         translation (LLM Aya / NLLB-200)
+  translate/         translation (LLM Aya / Dragoman / NLLB-200)
   subtitles/         .srt / styled .ass generation
   tts/               dubbing (in progress)
   pipeline/          orchestration (runner) + progress/cancel (events)

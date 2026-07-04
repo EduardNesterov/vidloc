@@ -19,7 +19,8 @@ Vidloc — локальный десктопный локализатор вид
 ## Текущий статус
 
 - **Phase 1** (распознавание → перевод → субтитры): готово, протестировано end-to-end.
-- **Phase 1b** (озвучка/дубляж: XTTS-v2 / Piper / ukrainian-tts): в работе.
+- **Phase 1b** (озвучка/дубляж: StyleTTS2-Ukrainian / ukrainian-tts / Piper /
+  Coqui / F5-TTS): в работе.
 - **Phase 2** (удаление вотермарок / вшитых субтитров): работает в GUI как **пошаговый мастер**:
   - workspace-кэш (`vidloc/workspace.py`): скачанный исходник + ASR-транскрипт по моделям →
     повтор того же видео не качает/не распознаёт заново.
@@ -192,6 +193,22 @@ H.264 → весь ролик всё равно транскодится AV1→H
 
 **Конвенция по коммитам:** коммитим **локально**; `git push` — только по явной просьбе.
 
+## Озвучка и перевод — актуальный апгрейд
+
+- Основной TTS-движок по умолчанию: **StyleTTS2-Ukrainian**,
+  `patriotyk/styletts2_ukrainian_multispeaker_hifigan`, worker
+  `vidloc/tts/styletts2_worker.py`, venv `.venv-styletts2`. Голоса берутся из Space
+  `patriotyk/styletts2-ukrainian` (`voices/*.pt`) и кэшируются в `models/styletts2/`.
+- Старые движки сохранены: `uktts`, `piper`, `coqui_uk`. F5-TTS добавлен как
+  экспериментальный `f5_uk`: worker `vidloc/tts/f5_worker.py`, venv `.venv-f5`,
+  reference wav берётся из `tts_clone_reference` или из первого ASR-сегмента исходного видео.
+- TTS по-прежнему запускается только subprocess-воркерами в своих venv. Не импортировать
+  StyleTTS2/F5/Coqui/Piper/ukrainian-tts в основную `.venv`.
+- Перевод по умолчанию остаётся **Aya** (`TranslateQuality.NATURAL`,
+  `mlx-community/aya-expanse-8b-4bit`). NLLB `fast/best` не менялись. Добавлен спец-режим
+  **Dragoman** (`TranslateQuality.DRAGOMAN`, `lang-uk/dragoman-4bit`) только EN→UK;
+  для RU/IT или при ошибке загрузки/генерации pipeline мягко откатывается на Aya.
+
 ## Как запускать
 
 - GUI: `./run.sh` (PySide6).
@@ -207,12 +224,34 @@ H.264 → весь ролик всё равно транскодится AV1→H
 
 ## Несколько venv — это намеренно
 
-В проекте 5 окружений: `.venv` (ядро) + `.venv-tts`, `.venv-uktts`, `.venv-piper`,
-`.venv-inpaint`. Движки озвучки и inpainting конфликтуют по зависимостям с ядром и между
-собой, поэтому вынесены в отдельные venv. Все они в `.gitignore`.
+В проекте несколько окружений: `.venv` (ядро) + `.venv-styletts2`, `.venv-tts`,
+`.venv-uktts`, `.venv-piper`, `.venv-f5`, `.venv-inpaint`. Движки озвучки и inpainting
+конфликтуют по зависимостям с ядром и между собой, поэтому вынесены в отдельные venv. Все
+они в `.gitignore`.
 
-**Известный пробел:** создание вспомогательных venv пока не заскриптовано и не описано —
-задокументировать/сделать скрипт до того, как делиться репозиторием с кем-то.
+Команды установки вспомогательных TTS-venv (ставить только нужные):
+
+```sh
+uv venv .venv-styletts2 --python 3.11
+uv pip install --python .venv-styletts2/bin/python \
+  soundfile librosa scipy einops einops_exts munch pyyaml torch torchaudio \
+  transformers "numpy<2" accelerate ctranslate2 sentencepiece huggingface-hub \
+  git+https://github.com/patriotyk/ukrainian-word-stress.git \
+  git+https://github.com/patriotyk/ipa-uk.git \
+  git+https://github.com/patriotyk/styletts2-inference.git
+
+uv venv .venv-uktts --python 3.11
+uv pip install --python .venv-uktts/bin/python ukrainian-tts
+
+uv venv .venv-piper --python 3.11
+uv pip install --python .venv-piper/bin/python piper-tts onnxruntime ukrainian-word-stress
+
+uv venv .venv-tts --python 3.11
+uv pip install --python .venv-tts/bin/python coqui-tts torch torchaudio
+
+uv venv .venv-f5 --python 3.11
+uv pip install --python .venv-f5/bin/python f5-tts soundfile
+```
 
 ## Конвенции
 

@@ -323,6 +323,7 @@ class MainWindow(QMainWindow):
         self.cmb_mode.currentIndexChanged.connect(self._sync_enabled)
         self.cmb_mt = _combo([
             ("Натуральний LLM — жива мова, сленг (реком.)", "natural"),
+            ("Dragoman — EN→UK спеціалізований", "dragoman"),
             ("Швидко (NLLB 600M) — дослівно", "fast"),
             ("Найкраще (NLLB 1.3B) — дослівно", "best"),
         ])
@@ -465,9 +466,11 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Озвучення (дубляж)")
         form = QFormLayout(box)
         self.cmb_tts = _combo([
-            ("Ukrainian-TTS — 5 голосів (рекомендовано)", "uktts"),
+            ("StyleTTS2 Ukrainian — натурально (рекомендовано)", "styletts2_uk"),
+            ("Ukrainian-TTS — 5 голосів", "uktts"),
             ("Piper — 3 голоси, інший тембр", "piper"),
             ("Coqui VITS — 1 голос (запасний)", "coqui_uk"),
+            ("F5-TTS — клон голосу з оригіналу (експеримент)", "f5_uk"),
         ])
         self.cmb_tts.currentIndexChanged.connect(self._refresh_voices)
         self.cmb_voice = QComboBox()

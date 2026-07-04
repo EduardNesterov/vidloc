@@ -175,7 +175,6 @@ def render_video(src: str, out: str, output: OutputConfig, *,
     vfilter = ",".join(vf)
 
     args: List[str] = list(inputs)
-    aout_label: Optional[str] = None
 
     # ---- audio: replace, duck-mix, or passthrough --------------------- #
     use_complex = bool(dub_path) and keep_background and src_has_audio
@@ -187,7 +186,6 @@ def render_video(src: str, out: str, output: OutputConfig, *,
             args += ["-filter_complex", fc, "-map", "[vout]", "-map", "[aout]"]
         else:
             args += ["-filter_complex", fc, "-map", "0:v:0", "-map", "[aout]"]
-        aout_label = "[aout]"
     else:
         if vfilter:
             args += ["-vf", vfilter, "-map", "0:v:0"]

@@ -86,6 +86,7 @@ class TranslateQuality(str, Enum):
     FAST = "fast"          # NLLB-200 600M — fast, literal
     BEST = "best"          # NLLB-200 1.3B — slower, literal
     NATURAL = "natural"    # local LLM — idiomatic, slang-aware, not word-for-word
+    DRAGOMAN = "dragoman"  # EN->UK sentence-level Dragoman (Mistral LoRA via MLX)
 
 
 # NLLB sizes (literal but fast)
@@ -98,16 +99,41 @@ TRANSLATE_MODEL = {
 # Aya-expanse is multilingual-optimized and clearly the strongest at Ukrainian of the
 # locally-runnable options (Qwen-7B invented non-words; Aya is fluent and idiomatic).
 LLM_TRANSLATE_MODEL = "mlx-community/aya-expanse-8b-4bit"
+DRAGOMAN_TRANSLATE_MODEL = "lang-uk/dragoman-4bit"
 
 
 class TTSEngine(str, Enum):
+    STYLETTS2_UK = "styletts2_uk"  # StyleTTS2-Ukrainian multispeaker (natural)
     UKTTS = "uktts"        # ukrainian-tts (robinhad): 5 natural UA voices + stress
     PIPER = "piper"        # Piper (ONNX): 3 UA voices, different timbre
     COQUI_UK = "coqui_uk"  # Coqui tts_models/uk/mai/vits: single UA voice (fallback)
+    F5_UK = "f5_uk"        # F5-TTS zero-shot voice cloning (experimental)
 
 
 # Engine -> list of (display label, voice id) for the GUI voice picker.
 TTS_VOICES = {
+    TTSEngine.STYLETTS2_UK: [
+        ("Інна Гелевера", "Інна Гелевера"),
+        ("Анастасія Павленко", "Анастасія Павленко"),
+        ("Артем Окороков", "Артем Окороков"),
+        ("Вʼячеслав Дудко", "Вʼячеслав Дудко"),
+        ("Вероніка Дорош", "Вероніка Дорош"),
+        ("Влада Муравець", "Влада Муравець"),
+        ("Вікторія Левченко", "Вікторія Левченко"),
+        ("Денис Денисенко", "Денис Денисенко"),
+        ("Катерина Потапенко", "Катерина Потапенко"),
+        ("Кирило Татарченко", "Кирило Татарченко"),
+        ("Марина Панас", "Марина Панас"),
+        ("Михайло Тишин", "Михайло Тишин"),
+        ("Олена Шверк", "Олена Шверк"),
+        ("Павло Буковський", "Павло Буковський"),
+        ("Петро Філяк", "Петро Філяк"),
+        ("Поліна Еккерт", "Поліна Еккерт"),
+        ("Роман Куліш", "Роман Куліш"),
+        ("Тарас Василюк", "Тарас Василюк"),
+        ("Тетяна Гончарова", "Тетяна Гончарова"),
+        ("Юрій Вихованець", "Юрій Вихованець"),
+    ],
     TTSEngine.UKTTS: [
         ("Тетяна (жіночий)", "tetiana"),
         ("Лада (жіночий)", "lada"),
@@ -122,6 +148,9 @@ TTS_VOICES = {
     ],
     TTSEngine.COQUI_UK: [
         ("Стандартний (жіночий)", "default"),
+    ],
+    TTSEngine.F5_UK: [
+        ("Клонувати голос з оригіналу", "clone"),
     ],
 }
 
@@ -225,7 +254,7 @@ class TranslateConfig:
     subtitle_style: SubtitleStyle = field(default_factory=SubtitleStyle)
     keep_source_subtitles: bool = False
     # dubbing
-    tts_engine: TTSEngine = TTSEngine.UKTTS
+    tts_engine: TTSEngine = TTSEngine.STYLETTS2_UK
     tts_voice: str = ""                       # voice id (see TTS_VOICES)
     tts_clone_reference: Optional[str] = None  # reserved for future cloning engines
     keep_background: bool = False              # default: replace original audio (clean voiceover)
