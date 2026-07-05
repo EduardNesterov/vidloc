@@ -29,11 +29,12 @@ flowchart TD
     LLM --> SEG["Translated segments"]
     NLLB --> SEG
 
-    SEG --> SUBS["Subtitles: SRT (soft) or styled ASS (burn)"]
-    SEG --> DUB["Dubbing: UA TTS — uktts / piper / coqui"]
-    IN --> INP["Watermark removal: LaMa / IOPaint (MPS) or ffmpeg delogo"]
+    SEG --> ED["Visual caption editor (optional): one source for burn + dub"]
+    ED --> SUBS["Subtitles: styled ASS (burn) or SRT (soft)"]
+    ED --> DUB["Dubbing: UA TTS — StyleTTS2 (default) / uktts / Piper / Coqui / F5 clone"]
+    IN --> INP["Removal: per-region LaMa worker (MPS) + CRAFT text detection, or ffmpeg delogo"]
 
-    SUBS --> REND["Final render — ffmpeg: codec/container/CRF, VideoToolbox"]
+    SUBS --> REND["Final render — ffmpeg: codec/container/CRF, original-track mix, VideoToolbox"]
     DUB --> REND
     INP --> REND
     REND --> OUT["Final video *_uk"]
@@ -41,7 +42,9 @@ flowchart TD
 
 Stage order lives in `pipeline/runner.py`. Stages are switched on by `JobConfig` (what actually
 needs doing), and **inpainting (GPU) and dubbing (CPU) run in parallel** in a single `process`
-stage — while the GPU cleans frames, the CPU synthesizes speech.
+stage — while the GPU cleans frames, the CPU synthesizes speech. When the visual editor has
+authored captions they are the single source of truth for both the burned-in subtitles and the
+dub, so ASR/translation are skipped on that run.
 
 ## Stages and models
 
@@ -50,9 +53,9 @@ stage — while the GPU cleans frames, the CPU synthesizes speech.
 | **ASR** | speech → timestamped text | `whisper-large-v3-mlx` (BEST, default), `whisper-large-v3-turbo` (BALANCED), `whisper-medium-mlx` (FAST) | Metal (MLX) |
 | **Translate · NATURAL** | idiomatic, slang-aware, by meaning | `mlx-community/aya-expanse-8b-4bit` (Cohere Aya) | Metal (MLX) |
 | **Translate · FAST/BEST** | literal, fast (fallback) | `facebook/nllb-200-distilled-600M` / `-1.3B` | Metal (PyTorch MPS) |
-| **Dubbing** | text → Ukrainian speech | ukrainian-tts (5 voices), Piper ONNX (3 voices), Coqui `uk/mai/vits` (fallback) | CPU (subprocess) |
-| **Watermark removal** | region inpainting | **LaMa** via IOPaint (QUALITY), `ffmpeg delogo` (FAST) | Metal (MPS) / ffmpeg |
-| **Render** | assemble final video | ffmpeg: H.264 / H.265, mp4 / mkv / mov / webm | VideoToolbox (opt.) |
+| **Dubbing** | text → Ukrainian speech | **StyleTTS2-Ukrainian** (default, 20 voices), ukrainian-tts (5), Piper ONNX (3), Coqui `uk/mai/vits` (fallback), F5-TTS (voice clone) | MPS / CPU (subprocess) |
+| **Removal** | per-region, time-gated inpainting | in-memory batched **LaMa** worker with plate-reuse + per-region tiles (BALANCED/BEST); **CRAFT** (ONNX+CoreML) text detection for the "text" box kind; `ffmpeg delogo` (FAST) | Metal (MPS / CoreML) / ffmpeg |
+| **Render** | assemble final video | ffmpeg: H.264 / H.265, mp4 / mkv / mov / webm; adjustable original-track mix under the dub (re-mixable without re-encode) | VideoToolbox (opt.) |
 
 Device selection — `settings.torch_device()`: `mps` → `cuda` → `cpu`. On Apple Silicon that's MPS;
 `PYTORCH_ENABLE_MPS_FALLBACK=1` routes the few ops not yet implemented on MPS to the CPU instead
@@ -65,9 +68,27 @@ of crashing.
 
 - **Isolated venvs + subprocess workers.** The dubbing and inpainting engines conflict on
   dependencies with the core (which uses `transformers 5`) and with each other (different torch
-  versions, ESPnet / VITS / ONNX). So each lives in its own venv (`.venv-uktts`, `.venv-tts`,
-  `.venv-piper`, `.venv-inpaint`) and is invoked as a separate process. The core stays clean and
-  stable.
+  versions, ESPnet / VITS / ONNX). So each lives in its own venv (`.venv-styletts2`, `.venv-uktts`,
+  `.venv-tts`, `.venv-piper`, `.venv-f5`, `.venv-inpaint`) and is invoked as a separate process.
+  The core stays clean and stable.
+
+- **Captions as one source of truth.** The visual editor produces a `Caption` list that drives
+  **both** the burned-in subtitles and the dub, so editing a line's text / timing / position
+  changes both at once. Splitting a line into short captions keeps the dub tempo by re-joining the
+  shared group into a single utterance.
+
+- **Removal driven by the user, accelerated by reuse.** Erasing follows the user's boxes +
+  time intervals (no fragile auto-detection). LaMa runs only where the marked background actually
+  moved — a real/estimated background *plate* is reused across stable and gapped frames — and it
+  inpaints small per-region tiles instead of the union crop. Up to ~94% of frames skip LaMa on
+  static content; ≈8× faster on scattered multi-region clips.
+
+- **Audio decoupled from the video encode.** The original-track level under the dub is a linear
+  gain mixed at render time; it can also be re-tuned on a **finished** file by rebuilding only the
+  audio (`-c:v copy`) from the cached dub + original — no re-encode and no repeated TTS.
+
+- **Per-video workspace cache.** The downloaded source plus the ASR transcript and translation are
+  cached per video, so re-running the same clip skips the download and the slow ASR pass entirely.
 
 - **An LLM for translation instead of "literal".** NLLB translates word-for-word; for natural
   language the default is a local LLM (Aya) with a **context pass**: the model first summarizes the
@@ -92,30 +113,39 @@ of crashing.
 
 ```
 vidloc/
-  settings.py          paths, env, device selection (MPS/CPU), HF_HOME → models/
-  models.py            enums + JobConfig (single source of truth for a job)
+  settings.py            paths, env, device selection (MPS/CPU), HF_HOME → models/
+  config.py              persisted user prefs (~/.vidloc, e.g. cookies browser)
+  models.py              enums + JobConfig (single source of truth for a job)
+  workspace.py           per-video cache: source + ASR transcript + translation
   media/
-    ffmpeg.py          probe / extract_audio / render_video, VideoToolbox
-    fetch.py           URL download (yt-dlp), context extraction
-  asr/                 speech recognition (mlx-whisper)
+    ffmpeg.py            probe / extract_audio / render_video / remix_audio, VideoToolbox
+    fetch.py             URL download (yt-dlp), browser-cookie auth, context extraction
+    proxy.py             H.264 scrub-preview + full-res master (fast decode)
+  asr/                   speech recognition (mlx-whisper)
   translate/
-    llm.py             natural translation (Aya, MLX) + context pass
-    translator.py      literal translation (NLLB-200, MPS)
+    llm.py               natural translation (Aya, MLX) + context pass
+    dragoman.py          EN→UK sentence translation (Dragoman, MLX)
+    translator.py        literal translation (NLLB-200, MPS)
+    service.py           shared translate_for_job helper (runner + editor)
   subtitles/
-    srt.py             soft subtitles (.srt)
-    ass.py             styled burned-in subtitles (.ass, libass + Montserrat)
-    rechunk.py         split into short captions (TikTok/Reels look)
+    srt.py               soft subtitles (.srt)
+    ass.py               styled burn — write_ass_captions (per-caption pos/style)
+    rechunk.py           split into short captions (TikTok/Reels look)
   tts/
-    dubbing.py         dubbing orchestration, time-fit to the original tempo
-    uktts_worker.py    ukrainian-tts (subprocess in .venv-uktts)
-    piper_worker.py    Piper ONNX (subprocess in .venv-piper)
-    coqui_worker.py    Coqui VITS (subprocess in .venv-tts)
+    dubbing.py           dubbing orchestration, time-fit to the original tempo
+    styletts2_worker.py  StyleTTS2-Ukrainian, default (subprocess in .venv-styletts2)
+    uktts_worker.py      ukrainian-tts (subprocess in .venv-uktts)
+    piper_worker.py      Piper ONNX (subprocess in .venv-piper)
+    coqui_worker.py      Coqui VITS (subprocess in .venv-tts)
+    f5_worker.py         F5-TTS voice clone (subprocess in .venv-f5)
   inpaint/
-    lama.py            neural LaMa inpainting via IOPaint (MPS)
-    delogo.py          fast ffmpeg delogo
+    lama_worker.py       streaming batched LaMa: reuse + per-region tiles (.venv-inpaint)
+    lama.py              inpaint driver (spawns the worker, wires ffmpeg I/O)
+    craft_onnx.py        CRAFT text detection (ONNX + CoreML) for "text" boxes
+    delogo.py            fast ffmpeg delogo
   pipeline/
-    runner.py          orchestration of all stages (see the diagram above)
-    events.py          progress and cancel (Reporter / StageTracker)
-  gui/                 PySide6: window, worker thread, region selector
-  cli.py               headless run
+    runner.py            orchestration of all stages (see the diagram above)
+    events.py            progress and cancel (Reporter / StageTracker)
+  gui/                   PySide6: window, subtitle & region editors, worker threads, fonts
+  cli.py                 headless run
 ```

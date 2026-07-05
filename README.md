@@ -3,7 +3,7 @@
 **English** · [Русский](README.ru.md)
 
 A desktop app (macOS / Apple Silicon) that translates video **EN/RU/IT → Ukrainian**
-(subtitles and/or dubbing) and — in later phases — removes watermarks and burned-in subtitles.
+(subtitles and/or dubbing) and removes watermarks and burned-in subtitles.
 Everything runs **locally**, with no data sent to the cloud.
 
 ## Features
@@ -12,12 +12,14 @@ Everything runs **locally**, with no data sent to the cloud.
 |:---:|---|
 | ✅ | Speech recognition (Whisper, mlx — Metal acceleration) |
 | ✅ | Translation into Ukrainian (local LLM Aya / Dragoman EN→UK / NLLB-200, Metal) |
-| ✅ | Subtitles: soft (separate track) or burned-in (hardsub) |
+| ✅ | Visual subtitle editor — captions are one source of truth for both burn-in and dubbing |
+| ✅ | Dubbing (Ukrainian voices: StyleTTS2 default / ukrainian-tts / Piper / Coqui / F5-TTS clone) |
+| ✅ | Adjustable original-track level under the dub + instant re-mix (no re-encode, no re-TTS) |
+| ✅ | Watermark & burned-in subtitle removal — per-region, time-gated (neural LaMa + CRAFT text detection) |
+| ✅ | Subtitle font library — 25 OFL families with full Ukrainian Cyrillic |
 | ✅ | Output: container (mp4/mkv/mov/webm), codec (H.264/H.265/copy), resolution, CRF, fps, audio bitrate |
-| ✅ | GUI with every setting + headless CLI |
-| 🚧 | Dubbing (Ukrainian voices: StyleTTS2 / ukrainian-tts / Piper / Coqui / F5-TTS clone) |
-| 🚧 | Watermark removal (neural inpainting: LaMa / IOPaint) |
-| 🚧 | Burned-in subtitle removal (OCR + inpainting) |
+| ✅ | GUI wizard + workspace cache (repeat runs skip download & ASR) + headless CLI |
+| ✅ | URL download (yt-dlp); Instagram via browser cookies |
 
 ## Requirements
 
@@ -87,21 +89,27 @@ Flags: `--mode {subtitles,voice,both,none}`, `--subs {soft,burn}`,
 ```
 vidloc/
   settings.py        paths, env, device selection (MPS/CPU)
+  config.py          user prefs (~/.vidloc: e.g. cookies browser)
   models.py          job config: enums + JobConfig dataclass
-  media/ffmpeg.py    ffmpeg wrappers (probe, extract_audio, render_video)
+  workspace.py       per-video cache (source + ASR transcript + translation)
+  media/             ffmpeg wrappers, yt-dlp fetch, H.264 proxy/master
   asr/               speech recognition (mlx-whisper)
-  translate/         translation (LLM Aya / Dragoman / NLLB-200)
-  subtitles/         .srt / styled .ass generation
-  tts/               dubbing (in progress)
+  translate/         translation (Aya / Dragoman / NLLB-200) + shared service
+  subtitles/         .srt / styled .ass generation + short-caption rechunk
+  tts/               dubbing (StyleTTS2 / uktts / Piper / Coqui / F5) in isolated venvs
+  inpaint/           watermark/subtitle removal (LaMa worker + CRAFT text detection)
   pipeline/          orchestration (runner) + progress/cancel (events)
-  gui/               PySide6: window, worker thread
+  gui/               PySide6: window, subtitle & region editors, worker threads
   cli.py             headless run
 ```
 
-Folders: `models/` — model cache, `work/` — per-job temp files, `output/` — results
-(all git-ignored).
+Folders: `models/` — model cache, `work/` — per-job temp files, `workspace/` — per-video
+cache, `output/` — results (all git-ignored).
 
 ## Status
 
 - **Phase 1 (translation → subtitles)** — done and tested end-to-end.
-- **Phase 1b (dubbing)** and **Phase 2 (object removal)** — in progress.
+- **Phase 1b (dubbing)** — done: StyleTTS2-Ukrainian by default, plus an adjustable
+  original-track mix that can be re-tuned on a finished render without re-encoding.
+- **Phase 2 (watermark / burned-in subtitle removal)** — working in the GUI wizard:
+  per-region, time-gated erasing with LaMa plate-reuse and CRAFT text detection.
