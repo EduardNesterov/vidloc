@@ -17,14 +17,33 @@ from .. import settings
 from ..media import ffmpeg
 from ..models import (
     ASR_MODEL,
-    DRAGOMAN_TRANSLATE_MODEL,
-    LLM_TRANSLATE_MODEL,
-    TRANSLATE_MODEL,
     JobConfig,
     SubtitlePlacement,
-    TranslateQuality,
 )
 from .events import Cancelled, Reporter, StageTracker
+
+
+def _captions_to_dub(captions) -> List[Dict]:
+    """Build the dub source from editor captions. Captions sharing a non-None ``group``
+    id were split from one sentence for display — re-join them into a single utterance
+    spanning the group so the TTS is synthesized (and paced) as one phrase, not chopped
+    into 3-word fragments. Ungrouped captions stay as individual units."""
+    caps = [c for c in captions if (getattr(c, "text", "") or "").strip()]
+    groups: Dict[int, list] = {}
+    items: List[Dict] = []
+    for c in caps:
+        if c.group is None:
+            items.append({"text": c.text, "text_tr": c.text,
+                          "start": float(c.start), "end": float(c.end)})
+        else:
+            groups.setdefault(c.group, []).append(c)
+    for members in groups.values():
+        members.sort(key=lambda c: c.start)
+        text = " ".join((m.text or "").strip() for m in members).strip()
+        items.append({"text": text, "text_tr": text,
+                      "start": float(members[0].start), "end": float(members[-1].end)})
+    items.sort(key=lambda d: d["start"])
+    return items
 
 
 class PipelineRunner:
@@ -63,7 +82,8 @@ class PipelineRunner:
         stages: List[tuple] = []
         if job.needs_asr:
             stages += [("audio", 0.05), ("asr", 0.35)]
-        if (job.needs_subtitles or job.needs_dubbing):
+        # Editor captions already carry translated text → no translate stage on run.
+        if (job.needs_subtitles or job.needs_dubbing) and not job.has_captions:
             stages.append(("translate", 0.15))
         if job.needs_inpaint or job.needs_dubbing:
             stages.append(("process", 0.40))
@@ -135,55 +155,31 @@ class PipelineRunner:
         # ---- 3. translate ---------------------------------------------- #
         if (job.needs_subtitles or job.needs_dubbing) and segments:
             t.start("translate", "Переклад на українську…")
-            tq = job.translate.translate_quality
-            if tq == TranslateQuality.DRAGOMAN:
-                if detected_lang == "en":
-                    r.log(f"Переклад: Dragoman EN→UK ({DRAGOMAN_TRANSLATE_MODEL})")
-                    try:
-                        from ..translate import dragoman
-                        segments = dragoman.translate_segments(
-                            segments, detected_lang, on_progress=lambda f: t.sub(f))
-                    except Exception as exc:  # noqa: BLE001
-                        r.log(f"⚠ Dragoman недоступний ({exc}); відкочуюсь на Aya.")
-                        from ..translate import llm
-                        segments = llm.translate_segments(
-                            segments, detected_lang, on_progress=lambda f: t.sub(f),
-                            extra_context=job.source_context)
-                else:
-                    r.log(f"Dragoman підтримує лише EN→UK; мова «{detected_lang}» → Aya.")
-                    from ..translate import llm
-                    segments = llm.translate_segments(
-                        segments, detected_lang, on_progress=lambda f: t.sub(f),
-                        extra_context=job.source_context)
-            elif tq == TranslateQuality.NATURAL:
-                r.log(f"Переклад: локальна LLM ({LLM_TRANSLATE_MODEL})")
-                try:
-                    from ..translate import llm
-                    segments = llm.translate_segments(
-                        segments, detected_lang, on_progress=lambda f: t.sub(f),
-                        extra_context=job.source_context)
-                except Exception as exc:  # noqa: BLE001 — degrade gracefully
-                    r.log(f"⚠ LLM-переклад недоступний ({exc}); відкочуюсь на NLLB.")
-                    from ..translate import translator
-                    segments = translator.translate_segments(
-                        segments, detected_lang, TRANSLATE_MODEL[TranslateQuality.FAST],
-                        beam_size=job.translate.beam_size, on_progress=lambda f: t.sub(f))
-            else:
-                tr_model = TRANSLATE_MODEL[tq]
-                r.log(f"Модель перекладу: {tr_model}")
-                from ..translate import translator
-                segments = translator.translate_segments(
-                    segments, detected_lang, tr_model,
-                    beam_size=job.translate.beam_size, on_progress=lambda f: t.sub(f))
+            from ..translate.service import translate_for_job
+            segments = translate_for_job(
+                segments, detected_lang, job,
+                on_progress=lambda f: t.sub(f), log=r.log)
             t.done()
             self._check()
 
-        # ---- 4. subtitles file (re-chunked; styled ASS if burned) ------ #
+        # ---- 4. subtitles file ----------------------------------------- #
+        # Editor captions (when present) are the source of truth and always burn,
+        # each positioned/styled per-caption. Otherwise fall back to the automatic
+        # ASR→translate→rechunk path (CLI / no editor): styled ASS burn or soft SRT.
         sub_file = None
         sub_burn = False
         fontsdir = None
-        if job.needs_subtitles and segments:
-            style = job.translate.subtitle_style
+        style = job.translate.subtitle_style
+        if job.needs_subtitles and job.has_captions:
+            from ..subtitles.ass import write_ass_captions
+            caps = job.translate.captions
+            ass_path = str(work / "uk.ass")
+            write_ass_captions(caps, ass_path, style, info.width, info.height)
+            sub_file = self._nospace_copy(ass_path)
+            sub_burn = True
+            fontsdir = str(settings.FONTS_DIR)
+            r.log(f"Субтитри з редактора: {len(caps)} реплік (вшивання).")
+        elif job.needs_subtitles and segments:
             from ..subtitles.rechunk import rechunk
             sub_segs = rechunk(segments, style.max_chars)
             sub_burn = job.translate.subtitle_placement == SubtitlePlacement.BURN
@@ -202,9 +198,17 @@ class PipelineRunner:
                 r.log(f"Субтитри ({len(sub_segs)} реплік): {srt_path}")
 
         # ---- inpaint (GPU)  ||  dubbing (CPU) — run in parallel -------- #
+        # The voiceover speaks whatever the captions say (edit subtitles → change the
+        # dub). Each caption is one synth unit laid onto the timeline at its start and
+        # fit to its [start, end]. Captions split from one sentence (shared group id)
+        # are re-joined into a single utterance so the tempo is not chopped. No captions
+        # → the raw translated segments.
+        dub_source = segments
+        if job.has_captions:
+            dub_source = _captions_to_dub(job.translate.captions)
         dub_path = None
         need_inp = job.needs_inpaint
-        need_dub = job.needs_dubbing and bool(segments)
+        need_dub = job.needs_dubbing and bool(dub_source)
         if need_inp or need_dub:
             import threading
             from concurrent.futures import ThreadPoolExecutor
@@ -245,7 +249,7 @@ class PipelineRunner:
                 try:
                     from ..tts import dubbing
                     results["dub"] = dubbing.synthesize_dub(
-                        segments, job, info, work, reporter=r,
+                        dub_source, job, info, work, reporter=r,
                         on_progress=lambda f: _bump("tts", f))
                 except Exception as exc:  # noqa: BLE001
                     errors["dub"] = exc
@@ -266,6 +270,14 @@ class PipelineRunner:
             if "cleaned" in results:
                 src_video = results["cleaned"]
             dub_path = results.get("dub")
+            # Persist the assembled dub so the GUI can retune the original-under-dub
+            # level onto the finished video later without re-running TTS.
+            if dub_path and ws:
+                try:
+                    ws.source.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(dub_path, ws.dub_file)
+                except OSError as exc:  # noqa: BLE001 — caching is best-effort
+                    r.log(f"Не вдалося зберегти дубляж у кеш: {exc}")
             t.done()
             self._check()
 
@@ -279,7 +291,7 @@ class PipelineRunner:
         ffmpeg.render_video(
             src_video, out, job.output,
             sub_path=sub_file, sub_burn=sub_burn, fontsdir=fontsdir,
-            dub_path=dub_path, keep_background=job.translate.keep_background,
+            dub_path=dub_path, bg_volume=job.translate.background_volume,
             src_has_audio=info.has_audio, duration=info.duration,
             on_progress=lambda f: t.sub(f), on_log=r.log,
         )

@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import settings
+from .. import config, settings
 from ..media import ffmpeg
 from ..models import (
     ASRQuality,
@@ -41,7 +41,6 @@ from ..models import (
     RemovalConfig,
     SourceLang,
     SubtitlePlacement,
-    SubtitlePosition,
     SubtitleStyle,
     TranslateConfig,
     TranslateMode,
@@ -51,7 +50,16 @@ from ..models import (
     VideoCodec,
 )
 from .region_editor import RegionEditor
-from .worker import DownloadWorker, JobWorker, ProxyWorker, RecognizeWorker, SaveWorker
+from .subtitle_editor import SubtitleEditor
+from .worker import (
+    CookieCheckWorker,
+    DownloadWorker,
+    JobWorker,
+    ProxyWorker,
+    RecognizeWorker,
+    RemixWorker,
+    SaveWorker,
+)
 
 STAGE_LABELS = {
     "inpaint": "Видалення об'єктів",
@@ -61,13 +69,6 @@ STAGE_LABELS = {
     "tts": "Озвучення",
     "render": "Збирання відео",
 }
-
-_COLOR_PRESETS = [
-    ("Білий", "#FFFFFF"), ("Чорний", "#000000"), ("Жовтий", "#FFE600"),
-    ("Червоний", "#FF2D2D"), ("Зелений", "#3DDB5A"), ("Блакитний", "#37B6FF"),
-    ("Рожевий", "#FF5FA2"), ("Помаранчевий", "#FF8A1E"),
-]
-
 
 def _combo(items: List[Tuple[str, object]]) -> QComboBox:
     box = QComboBox()
@@ -86,9 +87,13 @@ class MainWindow(QMainWindow):
         self.workspace_path = ""          # set once recognition has run for this video
         self._recognize_after_dl = False  # run recognition once a download finishes
         self.worker: JobWorker | None = None
+        self.remix_worker: RemixWorker | None = None
+        self._last_job = None                 # the JobConfig of the last render (for re-mix)
+        self._remix_ctx: dict | None = None   # {output, source, dub, ...} of the last dubbed render
         self.dl_worker: DownloadWorker | None = None
         self.save_worker: SaveWorker | None = None
         self.recog_worker: RecognizeWorker | None = None
+        self._cookie_worker: CookieCheckWorker | None = None
         self._proxy_worker: ProxyWorker | None = None
         self._proxy_ready_path = ""        # editor preview proxy, once prewarmed
         self._can_start = False           # main «Старт» unlocked only after removal step
@@ -96,6 +101,8 @@ class MainWindow(QMainWindow):
         self._clean_output = ""           # last produced watermark-free video
         self._hs_region = None
         self._regions: list = []          # multi-region editor: normalized (x,y,w,h) rects
+        self._captions: list = []         # subtitle editor: list[Caption] (subs + dub source)
+        self._sub_default_style = SubtitleStyle()  # global fallback for caption styling
         self._build_ui()
         self._sync_enabled()
 
@@ -120,11 +127,11 @@ class MainWindow(QMainWindow):
         self.sec_recog = self._recog_section()
         self.sec_removal = self._removal_section()
         self.sec_translate = self._translate_section()
-        self.sec_substyle = self._substyle_section()
+        self.sec_subedit = self._subtitles_section()
         self.sec_tts = self._tts_section()
         self.sec_output = self._output_section()
         for sec in (self.sec_downloader, self.sec_recog, self.sec_removal,
-                    self.sec_translate, self.sec_substyle, self.sec_tts,
+                    self.sec_translate, self.sec_subedit, self.sec_tts,
                     self.sec_output):
             col.addWidget(sec)
         col.addStretch(1)
@@ -137,7 +144,7 @@ class MainWindow(QMainWindow):
         # «Завантажувач». A video reveals «Розпізнавання»; once recognition has
         # run, that step disappears and the remaining sections appear.
         for sec in (self.sec_recog, self.sec_removal, self.sec_translate,
-                    self.sec_substyle, self.sec_tts, self.sec_output):
+                    self.sec_subedit, self.sec_tts, self.sec_output):
             sec.setVisible(False)
         self.ed_url.textChanged.connect(self._on_url_changed)
         self.btn_start.setEnabled(False)   # unlocked only after the removal step
@@ -164,10 +171,88 @@ class MainWindow(QMainWindow):
         url_row.addWidget(self.btn_dl)
         lay.addLayout(url_row)
 
+        lay.addLayout(self._cookies_row())
+
         self.lbl_info = QLabel("—")
         self.lbl_info.setStyleSheet("color: gray;")
         lay.addWidget(self.lbl_info)
         return box
+
+    def _cookies_row(self) -> QHBoxLayout:
+        """Instagram/private downloads need a logged-in browser session. Let the user
+        pick which browser (or a cookies.txt) and test it — no env vars needed."""
+        self.cmb_cookies = _combo([
+            ("Авто (визначити сам)", "auto"),
+            ("Google Chrome", "chrome"),
+            ("Firefox", "firefox"),
+            ("Safari", "safari"),
+            ("Brave", "brave"),
+            ("Microsoft Edge", "edge"),
+            ("Chromium", "chromium"),
+            ("Файл cookies.txt…", "file"),
+        ])
+        self.cmb_cookies.setToolTip(
+            "Для приватних / залогінених відео (Instagram) застосунок бере куки з "
+            "браузера, у якому ти увійшов у акаунт. Обери свій браузер і натисни "
+            "«Перевірити». Safari потребує macOS-дозволу «Повний доступ до диска».")
+        self.btn_check_cookies = QPushButton("Перевірити")
+        self.btn_check_cookies.clicked.connect(self._check_cookies)
+        self.lbl_cookies = QLabel("")
+        self.lbl_cookies.setStyleSheet("color: gray;")
+        self._load_cookies_ui()
+        self.cmb_cookies.currentIndexChanged.connect(self._on_cookies_changed)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Instagram-вхід:"))
+        row.addWidget(self.cmb_cookies)
+        row.addWidget(self.btn_check_cookies)
+        row.addWidget(self.lbl_cookies, 1)
+        return row
+
+    def _load_cookies_ui(self) -> None:
+        """Reflect the saved cookie choice in the combo + label."""
+        self.cmb_cookies.blockSignals(True)
+        cfile = config.get("cookies_file")
+        if cfile:
+            self.cmb_cookies.setCurrentIndex(self.cmb_cookies.findData("file"))
+            self.lbl_cookies.setText(f"файл: {Path(cfile).name}")
+        else:
+            browser = config.get("cookies_browser") or "auto"
+            idx = self.cmb_cookies.findData(browser)
+            self.cmb_cookies.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cmb_cookies.blockSignals(False)
+
+    def _on_cookies_changed(self) -> None:
+        val = self.cmb_cookies.currentData()
+        if val == "file":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Оберіть cookies.txt", str(Path.home()),
+                "Cookies (*.txt);;Усі файли (*.*)")
+            if path:
+                config.set("cookies_file", path)
+                config.set("cookies_browser", "")
+                self.lbl_cookies.setText(f"файл: {Path(path).name}")
+            else:
+                self._load_cookies_ui()       # cancelled → restore previous choice
+            return
+        config.set("cookies_browser", val)
+        config.set("cookies_file", "")
+        self.lbl_cookies.setText("")
+
+    def _check_cookies(self) -> None:
+        val = self.cmb_cookies.currentData()
+        browser = "" if val in ("auto", "file") else val
+        cfile = config.get("cookies_file") if val == "file" else ""
+        self.btn_check_cookies.setEnabled(False)
+        self.lbl_cookies.setText("Перевіряю…")
+        self.lbl_cookies.setStyleSheet("color:#37b6ff;")
+        self._cookie_worker = CookieCheckWorker(browser, cfile, self)
+        self._cookie_worker.sig_done.connect(self._on_cookies_checked)
+        self._cookie_worker.start()
+
+    def _on_cookies_checked(self, ok: bool, msg: str) -> None:
+        self.btn_check_cookies.setEnabled(True)
+        self.lbl_cookies.setText(msg)
+        self.lbl_cookies.setStyleSheet("color:#2d7d46;" if ok else "color:#c8442e;")
 
     def _downloader_section(self) -> QGroupBox:
         box = QGroupBox("Завантажувач — зберегти на диск (без перекладу)")
@@ -337,98 +422,60 @@ class MainWindow(QMainWindow):
         beam_row.addWidget(self.lbl_beam)
         beam_wrap = QWidget()
         beam_wrap.setLayout(beam_row)
-        self.cmb_subpos = _combo([
-            ("М'які — окрема доріжка (вмикаються в плеєрі)", "soft"),
-            ("Вшити у відео (hardsub)", "burn"),
-        ])
         self.chk_keepsrc = QCheckBox("Додатково зберегти субтитри мовою оригіналу")
         form.addRow("Мова оригіналу:", self.cmb_src)
         form.addRow("Що робимо:", self.cmb_mode)
         form.addRow("Якість перекладу:", self.cmb_mt)
         form.addRow("Глибина пошуку (beam):", beam_wrap)
-        form.addRow("Субтитри:", self.cmb_subpos)
         form.addRow(self.chk_keepsrc)
-        note = QLabel("Більше beam = якісніше, але повільніше.")
+        note = QLabel("Субтитри вшиваються (burn) через «Редактор субтитрів» нижче. "
+                      "Більше beam = якісніше, але повільніше.")
         note.setStyleSheet("color: gray;")
         form.addRow("", note)
         return box
 
-    def _substyle_section(self) -> QGroupBox:
-        box = QGroupBox("Стиль субтитрів")
+    def _subtitles_section(self) -> QGroupBox:
+        box = QGroupBox("Субтитри (візуальний редактор)")
         form = QFormLayout(box)
-        self.cmb_subfont = _combo([
-            ("Montserrat Black (жирний)", "Montserrat Black"),
-            ("Montserrat ExtraBold", "Montserrat ExtraBold"),
-            ("Montserrat Bold", "Montserrat"),
-        ])
-        self.cmb_position = _combo([
-            ("По центру екрана", "center"), ("Знизу", "bottom"),
-        ])
-        self.cmb_chunk = _combo([
-            ("Короткі (~20)", 20), ("Середні (~28)", 28),
-            ("Довші (~42)", 42), ("Цілі речення", 0),
-        ])
-        self.cmb_chunk.setCurrentIndex(1)
-        self.sld_subsize = QSlider(Qt.Orientation.Horizontal)
-        self.sld_subsize.setRange(4, 12)
-        self.sld_subsize.setValue(7)
-        self.lbl_subsize = QLabel("7%")
-        self.sld_subsize.valueChanged.connect(lambda v: self.lbl_subsize.setText(f"{v}%"))
-        sz_row = QHBoxLayout()
-        sz_row.addWidget(self.sld_subsize, 1)
-        sz_row.addWidget(self.lbl_subsize)
-        sz_wrap = QWidget()
-        sz_wrap.setLayout(sz_row)
-        self.chk_caps = QCheckBox("ВЕЛИКІ ЛІТЕРИ")
-        form.addRow("Шрифт:", self.cmb_subfont)
-        form.addRow("Положення:", self.cmb_position)
-        form.addRow("Довжина реплік:", self.cmb_chunk)
-        form.addRow("Розмір:", sz_wrap)
-        form.addRow("Колір тексту:", self._color_control("_text_color", "#FFFFFF"))
-        form.addRow("Колір обведення:", self._color_control("_outline_color", "#000000"))
-        form.addRow(self.chk_caps)
-        note = QLabel("Шрифт / розмір / положення / колір / КАПС діють лише для «Вшити у відео» "
-                      "(м'які субтитри стилізує плеєр). Довжина реплік — для обох.")
+        self.btn_subedit = QPushButton("Відкрити редактор субтитрів…")
+        self.btn_subedit.clicked.connect(self._edit_subtitles)
+        self.lbl_subs = QLabel("субтитрів: 0")
+        self.lbl_subs.setStyleSheet("color: gray;")
+        row = QHBoxLayout()
+        row.addWidget(self.btn_subedit)
+        row.addWidget(self.lbl_subs, 1)
+        wrap = QWidget()
+        wrap.setLayout(row)
+        form.addRow(wrap)
+        note = QLabel("У редакторі розставляєш субтитри рамками на кадрі, задаєш час на "
+                      "таймлайні та стиль (шрифт/колір/обведення) для кожної репліки. "
+                      "«Підтягнути переклад» заповнить їх перекладеним текстом. Ці ж репліки "
+                      "керують озвучкою — дубляж говорить те, що на екрані.")
         note.setWordWrap(True)
         note.setStyleSheet("color: gray;")
         form.addRow(note)
         return box
 
-    def _color_control(self, attr_name: str, default: str) -> QWidget:
-        """Preset colours + a «Свій колір…» picker. Stores the hex in self.<attr_name>."""
-        setattr(self, attr_name, default)
-        combo = _combo(_COLOR_PRESETS + [("Свій колір…", "custom")])
-        for i in range(combo.count()):
-            if combo.itemData(i) == default:
-                combo.setCurrentIndex(i)
-                break
-        swatch = QLabel()
-        swatch.setFixedSize(34, 18)
-
-        def update_swatch() -> None:
-            swatch.setStyleSheet(
-                f"background:{getattr(self, attr_name)}; border:1px solid gray;")
-
-        def on_change() -> None:
-            data = combo.currentData()
-            if data == "custom":
-                from PySide6.QtGui import QColor
-                from PySide6.QtWidgets import QColorDialog
-                c = QColorDialog.getColor(QColor(getattr(self, attr_name)), self, "Колір")
-                if c.isValid():
-                    setattr(self, attr_name, c.name())
-            else:
-                setattr(self, attr_name, data)
-            update_swatch()
-
-        combo.currentIndexChanged.connect(on_change)
-        update_swatch()
-        row = QHBoxLayout()
-        row.addWidget(combo, 1)
-        row.addWidget(swatch)
-        wrap = QWidget()
-        wrap.setLayout(row)
-        return wrap
+    def _edit_subtitles(self) -> None:
+        """Open the visual subtitle editor; captions persist on the window state."""
+        pix = self._preview_pixmap()
+        if pix is None:
+            return
+        dur, vw, vh = 0.0, 0, 0
+        try:
+            info = ffmpeg.probe(self.input_path)
+            dur, vw, vh = info.duration, info.width, info.height
+        except Exception:  # noqa: BLE001
+            pass
+        dlg = SubtitleEditor(
+            pix, self._captions, default_style=self._sub_default_style, duration=dur,
+            frame_provider=self._frame_at, src=self.input_path,
+            proxy_ready=self._proxy_ready_path or None, proxy_worker=self._proxy_worker,
+            job=self._build_job(), workspace_root=self.workspace_path,
+            video_w=vw, video_h=vh, parent=self)
+        if dlg.exec():
+            self._captions = dlg.result_captions()
+            self.lbl_subs.setText(f"субтитрів: {len(self._captions)}")
 
     def _recog_section(self) -> QGroupBox:
         box = QGroupBox("Розпізнавання тексту")
@@ -485,8 +532,20 @@ class MainWindow(QMainWindow):
         sp_row.addWidget(self.lbl_speed)
         sp_wrap = QWidget()
         sp_wrap.setLayout(sp_row)
-        self.chk_bg = QCheckBox("Залишити оригінальний звук (музику) тихо під озвучкою")
-        self.chk_bg.setChecked(False)
+        # Original-track level under the dub: 0% = clean voiceover (replace original),
+        # up to 100% = original at full. It is the *relative* level vs. the dub, so it
+        # can be retuned onto a finished render without re-encoding (see «Пересобрати звук»).
+        self.sld_bg = QSlider(Qt.Orientation.Horizontal)
+        self.sld_bg.setRange(0, 100)
+        self.sld_bg.setValue(0)
+        self.lbl_bg = QLabel("вимк.")
+        self.sld_bg.valueChanged.connect(
+            lambda v: self.lbl_bg.setText("вимк." if v == 0 else f"{v}%"))
+        bg_row = QHBoxLayout()
+        bg_row.addWidget(self.sld_bg, 1)
+        bg_row.addWidget(self.lbl_bg)
+        bg_wrap = QWidget()
+        bg_wrap.setLayout(bg_row)
         form.addRow("Рушій:", self.cmb_tts)
         form.addRow("Голос:", self.cmb_voice)
         form.addRow("Темп озвучки:", sp_wrap)
@@ -494,7 +553,17 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
         form.addRow("", hint)
-        form.addRow(self.chk_bg)
+        form.addRow("Оригінал під озвучкою:", bg_wrap)
+        bg_hint = QLabel("0% = лише озвучка (чистий голос). Більше = гучніше музика/оригінал під нею.")
+        bg_hint.setWordWrap(True)
+        bg_hint.setStyleSheet("color: gray;")
+        form.addRow("", bg_hint)
+        # After a dubbed render, retune this level on the finished file in seconds —
+        # rebuilds only the audio (stream-copies the picture), no re-encode / no re-TTS.
+        self.btn_remix = QPushButton("Пересобрати звук останнього відео (без перекодування)")
+        self.btn_remix.setEnabled(False)
+        self.btn_remix.clicked.connect(self._remix)
+        form.addRow("", self.btn_remix)
         self._refresh_voices()
         return box
 
@@ -603,9 +672,12 @@ class MainWindow(QMainWindow):
         self.cmb_src.setEnabled(wants_any)
         self.cmb_mt.setEnabled(wants_any)
         self.sld_beam.setEnabled(wants_any)
-        self.cmb_subpos.setEnabled(wants_text)
         self.chk_keepsrc.setEnabled(wants_text)
-        for w in (self.cmb_tts, self.cmb_voice, self.chk_bg, self.sld_speed):
+        # The caption editor drives both burned subtitles AND dubbing, so it is
+        # relevant whenever we produce text or voice. In voice-only mode the captions
+        # are not burned — they just steer what the dub says (and when).
+        self.sec_subedit.setEnabled(wants_text or wants_voice)
+        for w in (self.cmb_tts, self.cmb_voice, self.sld_bg, self.sld_speed):
             w.setEnabled(wants_voice)
         # CRF only matters when we actually (re-)encode
         self.sld_crf.setEnabled(self.cmb_codec.currentData() != "keep")
@@ -741,7 +813,12 @@ class MainWindow(QMainWindow):
         self._proxy_worker.start()
 
     def _on_proxy_ready(self, path: str) -> None:
-        self._proxy_ready_path = path
+        # Only accept the proxy that belongs to the CURRENT input. A prewarm started
+        # for the original video can finish after we've adopted the cleaned file — its
+        # (stale) path must not overwrite the cleaned file's proxy.
+        from ..media import proxy
+        if self.input_path and path == str(proxy.proxy_path(self.input_path)):
+            self._proxy_ready_path = path
 
     # -- removal step ---------------------------------------------------- #
     def _on_removal_toggled(self, on: bool) -> None:
@@ -846,6 +923,11 @@ class MainWindow(QMainWindow):
         self.ed_input.setText(path)
         self.lbl_info.setText("Використовується очищене відео (без вотермарок / субтитрів)")
         self.chk_do_removal.setChecked(False)   # done → block becomes inactive
+        # The scrub-preview proxy was prewarmed for the ORIGINAL video; the adopted
+        # cleaned file is a different source (different proxy_path), so drop the stale
+        # proxy and rebuild it — otherwise the subtitle editor would play the original.
+        self._proxy_ready_path = ""
+        self._prewarm_proxy()
         self._reveal_rest_after_removal()
 
     def _on_skip_removal(self) -> None:
@@ -854,8 +936,8 @@ class MainWindow(QMainWindow):
         self._reveal_rest_after_removal()
 
     def _reveal_rest_after_removal(self) -> None:
-        """Open subtitles / style / dubbing / output and unlock «Старт»."""
-        for sec in (self.sec_translate, self.sec_substyle, self.sec_tts, self.sec_output):
+        """Open translate / subtitle editor / dubbing / output and unlock «Старт»."""
+        for sec in (self.sec_translate, self.sec_subedit, self.sec_tts, self.sec_output):
             sec.setVisible(True)
         self._can_start = True
         self.btn_start.setEnabled(True)
@@ -981,28 +1063,22 @@ class MainWindow(QMainWindow):
             hw_encode=enc_hw or self.chk_hw.isChecked(),
             preset=enc_preset,
         )
-        style = SubtitleStyle(
-            font=self.cmb_subfont.currentData(),
-            font_size_pct=float(self.sld_subsize.value()),
-            position=SubtitlePosition(self.cmb_position.currentData()),
-            max_chars=int(self.cmb_chunk.currentData()),
-            uppercase=self.chk_caps.isChecked(),
-            primary_color=self._text_color,
-            outline_color=self._outline_color,
-        )
         tr = TranslateConfig(
             mode=TranslateMode(self.cmb_mode.currentData()),
             source=SourceLang(self.cmb_src.currentData()),
             asr_quality=ASRQuality(self.cmb_asr.currentData()),
             translate_quality=TranslateQuality(self.cmb_mt.currentData()),
             beam_size=self.sld_beam.value(),
-            subtitle_placement=SubtitlePlacement(self.cmb_subpos.currentData()),
-            subtitle_style=style,
+            # subtitles are burned via the visual editor; captions (when authored)
+            # are the source of truth for both burn-in and dubbing.
+            subtitle_placement=SubtitlePlacement.BURN,
+            subtitle_style=self._sub_default_style,
+            captions=list(self._captions),
             keep_source_subtitles=self.chk_keepsrc.isChecked(),
             tts_engine=TTSEngine(self.cmb_tts.currentData()),
             tts_voice=self.cmb_voice.currentData(),
             tts_clone_reference=None,
-            keep_background=self.chk_bg.isChecked(),
+            background_volume=self.sld_bg.value() / 100.0,
             tts_speed=self.sld_speed.value() / 100.0,
         )
         do_rm = self.chk_do_removal.isChecked()
@@ -1025,10 +1101,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Немає файлу", "Спочатку оберіть вхідне відео.")
             return
         job = self._build_job()
+        self._last_job = job
         self.log.clear()
         self.progress.setValue(0)
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(True)
+        self.btn_remix.setEnabled(False)   # stale until this render finishes
 
         self.worker = JobWorker(job)
         self.worker.sig_progress.connect(self._on_progress)
@@ -1065,6 +1143,7 @@ class MainWindow(QMainWindow):
             self.btn_inpaint.setEnabled(self.chk_do_removal.isChecked())
             self._removal_done_dialog(out_path)
             return
+        self._arm_remix(out_path)
         box = QMessageBox(self)
         box.setWindowTitle("Готово")
         box.setText(f"Файл збережено:\n{out_path}")
@@ -1082,3 +1161,70 @@ class MainWindow(QMainWindow):
         self.btn_skip_removal.setEnabled(self.chk_do_removal.isChecked())
         self.lbl_stage.setText("Помилка ⚠")
         QMessageBox.critical(self, "Помилка", message)
+
+    # -- fast audio re-mix (retune original-under-dub without re-encoding) ---- #
+    def _arm_remix(self, out_path: str) -> None:
+        """After a dubbed render, remember the stems so the user can retune the
+        original-under-dub level on this file in seconds. Needs the persisted dub
+        (kept in the workspace) and the original source for its audio."""
+        job = getattr(self, "_last_job", None)
+        self._remix_ctx = None
+        self.btn_remix.setEnabled(False)
+        if not (job and job.needs_dubbing and self.workspace_path):
+            return
+        from ..workspace import Workspace
+        dub = Workspace.at(self.workspace_path).dub_file
+        if not dub.is_file():
+            return
+        self._remix_ctx = {"output": out_path, "source": job.input_path,
+                           "dub": str(dub), "bitrate": job.output.audio_bitrate,
+                           "container": job.output.container.value}
+        self.btn_remix.setEnabled(True)
+
+    def _remix(self) -> None:
+        ctx = self._remix_ctx
+        if not ctx or not os.path.exists(ctx["output"]):
+            QMessageBox.information(
+                self, "Немає що пересобирати",
+                "Спершу зробіть відео з озвучкою — тоді можна змінювати гучність оригіналу.")
+            return
+        from ..media import ffmpeg
+        try:
+            dur = ffmpeg.probe(ctx["output"]).duration
+        except Exception:  # noqa: BLE001
+            dur = 0.0
+        self.btn_remix.setEnabled(False)
+        self.btn_start.setEnabled(False)
+        self.progress.setValue(0)
+        self.lbl_stage.setText("Пересобираю звук…")
+        self.remix_worker = RemixWorker(
+            ctx["output"], ctx["output"], dub_path=ctx["dub"], orig_src=ctx["source"],
+            bg_volume=self.sld_bg.value() / 100.0, audio_bitrate=ctx["bitrate"],
+            container=ctx["container"], duration=dur)
+        self.remix_worker.sig_progress.connect(lambda f: self.progress.setValue(int(f * 1000)))
+        self.remix_worker.sig_log.connect(self._on_log)
+        self.remix_worker.sig_done.connect(self._on_remix_done)
+        self.remix_worker.sig_fail.connect(self._on_remix_fail)
+        self.remix_worker.start()
+
+    def _on_remix_done(self, out_path: str) -> None:
+        self.progress.setValue(1000)
+        self.btn_start.setEnabled(self._can_start)
+        self.btn_remix.setEnabled(True)
+        lvl = self.sld_bg.value()
+        self.lbl_stage.setText(
+            f"Звук пересобрано ✅ (оригінал {'вимк.' if lvl == 0 else f'{lvl}%'})")
+        box = QMessageBox(self)
+        box.setWindowTitle("Готово")
+        box.setText(f"Гучність оригіналу оновлено без перекодування:\n{out_path}")
+        reveal = box.addButton("Показати у Finder", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Закрити", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is reveal:
+            subprocess.run(["open", "-R", out_path], check=False)
+
+    def _on_remix_fail(self, message: str) -> None:
+        self.btn_start.setEnabled(self._can_start)
+        self.btn_remix.setEnabled(True)
+        self.lbl_stage.setText("Помилка ⚠")
+        QMessageBox.critical(self, "Помилка пересобирання звуку", message)

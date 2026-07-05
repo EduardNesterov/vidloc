@@ -46,6 +46,8 @@ def main() -> int:
     app.setApplicationName("Vidloc")
     app.setApplicationDisplayName("Vidloc — локалізатор відео (UA)")
     app.setStyleSheet(STYLESHEET)
+    from . import fonts
+    fonts.load()               # register bundled subtitle fonts with Qt (for the editor)
     win = MainWindow()
     win.show()
     return app.exec()

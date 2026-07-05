@@ -13,6 +13,9 @@ workspace/
 output/
 *.log
 
+# Local test clips (not part of the project)
+/for test 720p.mp4
+
 # Claude Code local settings
 .claude/settings.local.json
 

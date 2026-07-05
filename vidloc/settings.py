@@ -24,10 +24,21 @@ WORK_DIR = Path(os.environ.get("VIDLOC_WORK_DIR", str(ROOT / "work")))
 # runs skip re-downloading and re-transcribing. See vidloc/workspace.py.
 WORKSPACE_DIR = Path(os.environ.get("VIDLOC_WORKSPACE_DIR", str(ROOT / "workspace")))
 OUTPUT_DIR = Path(os.environ.get("VIDLOC_OUTPUT_DIR", str(ROOT / "output")))
+# Persisted user preferences (e.g. the browser to read Instagram cookies from), set
+# from the GUI. Kept in the user's home so it survives project moves / reinstalls.
+CONFIG_DIR = Path(os.environ.get("VIDLOC_CONFIG_DIR", str(Path.home() / ".vidloc")))
 
 # Bundled static ffmpeg/ffprobe (Apple Silicon). Overridable via env.
 FFMPEG = os.environ.get("VIDLOC_FFMPEG", str(BIN_DIR / "ffmpeg"))
 FFPROBE = os.environ.get("VIDLOC_FFPROBE", str(BIN_DIR / "ffprobe"))
+
+# Cookies for auth-gated downloads (Instagram, private/age-gated posts). Instagram
+# now refuses anonymous requests, so yt-dlp needs a logged-in session. By default we
+# auto-read cookies from an installed browser you're logged into; override to force a
+# specific browser (chrome|safari|firefox|brave|edge|chromium|opera|vivaldi) or point
+# at an exported Netscape cookies.txt file.
+COOKIES_BROWSER = os.environ.get("VIDLOC_COOKIES_BROWSER", "").strip()
+COOKIES_FILE = os.environ.get("VIDLOC_COOKIES_FILE", "").strip()
 
 # All Hugging Face model downloads land here, inside the project.
 HF_HOME = MODELS_DIR / "huggingface"

@@ -176,6 +176,118 @@ class RecognizeWorker(QThread):
             self.sig_fail.emit(f"{type(exc).__name__}: {exc}")
 
 
+class CookieCheckWorker(QThread):
+    """Probes whether the chosen browser / cookies file has a logged-in Instagram
+    session, off the UI thread (reading Chromium cookies can raise a Keychain prompt)."""
+
+    sig_done = Signal(bool, str)   # ok, human message
+
+    def __init__(self, browser: str, cookies_file: str, parent=None):
+        super().__init__(parent)
+        self.browser = browser
+        self.cookies_file = cookies_file
+
+    def run(self) -> None:
+        try:
+            from ..media import fetch
+            ok, msg = fetch.check_cookies(self.browser, self.cookies_file)
+        except Exception as exc:  # noqa: BLE001
+            ok, msg = False, f"{type(exc).__name__}: {exc}"
+        self.sig_done.emit(ok, msg)
+
+
+class TranslateWorker(QThread):
+    """«Підтягнути переклад»: load the cached ASR transcript and translate it to
+    Ukrainian on its own thread, so the subtitle editor can seed captions from real
+    translated lines. The result is cached in the workspace (per ASR model × MT
+    quality) so re-opening the editor is instant."""
+
+    sig_progress = Signal(float, str)
+    sig_log = Signal(str)
+    sig_done = Signal(list)       # translated segments (dicts with text_tr/start/end)
+    sig_fail = Signal(str)
+
+    def __init__(self, job: JobConfig, workspace_root: str, parent=None):
+        super().__init__(parent)
+        self.job = job
+        self.workspace_root = workspace_root
+
+    def run(self) -> None:
+        try:
+            from ..workspace import Workspace
+            from ..translate.service import translate_for_job
+
+            ws = Workspace.at(self.workspace_root)
+            model = self.job.translate.asr_quality.value
+            mt = self.job.translate.translate_quality.value
+
+            cached_tr = ws.load_translation(model, mt)
+            if cached_tr:
+                self.sig_log.emit("♻ Переклад із кешу.")
+                self.sig_done.emit(cached_tr["segments"])
+                return
+
+            transcript = ws.load_transcript(model)
+            if not transcript:
+                self.sig_fail.emit(
+                    "Немає розпізнаного тексту. Спершу виконайте «Розпізнати».")
+                return
+            segments = transcript["segments"]
+            lang = transcript.get("language") or self.job.translate.source.value
+
+            self.sig_progress.emit(0.05, "Переклад на українську…")
+            translated = translate_for_job(
+                segments, lang, self.job,
+                on_progress=lambda f: self.sig_progress.emit(
+                    0.05 + 0.9 * (f or 0.0), "Переклад на українську…"),
+                log=lambda s: self.sig_log.emit(s))
+            ws.save_translation(model, mt, language=lang, segments=translated)
+            self.sig_progress.emit(1.0, "Переклад завершено")
+            self.sig_done.emit(translated)
+        except Exception as exc:  # noqa: BLE001
+            self.sig_log.emit(traceback.format_exc())
+            self.sig_fail.emit(f"{type(exc).__name__}: {exc}")
+
+
+class RemixWorker(QThread):
+    """Retune the original-under-dub level on an already-rendered video, off the UI
+    thread. Stream-copies the picture and rebuilds only the audio from the persisted
+    stems (original track + cached dub) — seconds, no re-encode, no TTS."""
+
+    sig_progress = Signal(float)   # 0..1
+    sig_log = Signal(str)
+    sig_done = Signal(str)         # output path
+    sig_fail = Signal(str)
+
+    def __init__(self, video: str, out: str, *, dub_path: str, orig_src: str,
+                 bg_volume: float, audio_bitrate: str, container: str,
+                 duration: float = 0.0, parent=None):
+        super().__init__(parent)
+        self.video = video
+        self.out = out
+        self.dub_path = dub_path
+        self.orig_src = orig_src
+        self.bg_volume = bg_volume
+        self.audio_bitrate = audio_bitrate
+        self.container = container
+        self.duration = duration
+
+    def run(self) -> None:
+        try:
+            from ..media import ffmpeg
+            from ..models import Container
+            ffmpeg.remix_audio(
+                self.video, self.out, dub_path=self.dub_path, orig_src=self.orig_src,
+                bg_volume=self.bg_volume, audio_bitrate=self.audio_bitrate,
+                container=Container(self.container), duration=self.duration,
+                on_progress=lambda f: self.sig_progress.emit(f or 0.0),
+                on_log=lambda s: self.sig_log.emit(s))
+            self.sig_done.emit(self.out)
+        except Exception as exc:  # noqa: BLE001
+            self.sig_log.emit(traceback.format_exc())
+            self.sig_fail.emit(f"{type(exc).__name__}: {exc}")
+
+
 class JobWorker(QThread):
     sig_progress = Signal(float, str)   # overall fraction 0..1, message
     sig_stage = Signal(str)             # stage id

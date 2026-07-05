@@ -64,6 +64,15 @@ class Workspace:
     def audio_file(self) -> Path:
         return self.source / "audio16k.wav"
 
+    @property
+    def dub_file(self) -> Path:
+        """Full-quality assembled dub of the *latest* run (overwritten each render).
+
+        Persisting it here lets the GUI re-mix the original-under-dub level onto a
+        finished video without re-running TTS (see ffmpeg.remix_audio). It is keyed to
+        the video, not the ASR model — it always mirrors the most recent dubbing pass."""
+        return self.source / "dub.wav"
+
     def source_video(self) -> Optional[Path]:
         """First video file already placed in ``Source/`` (if any)."""
         if not self.source.is_dir():
@@ -112,6 +121,32 @@ class Workspace:
         except Exception:  # noqa: BLE001
             return None
         return data if data.get("segments") else None
+
+    # -- translated segments cache (per ASR model × translate quality) ---- #
+    def translation_file(self, model: str, mt: str) -> Path:
+        return self.model_dir(model) / f"translated_{slugify(mt)}.json"
+
+    def load_translation(self, model: str, mt: str) -> Optional[Dict]:
+        """Cached translated segments for this (ASR model, translate quality)."""
+        f = self.translation_file(model, mt)
+        if not f.is_file():
+            return None
+        try:
+            data = json.loads(f.read_text("utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+        return data if data.get("segments") else None
+
+    def save_translation(self, model: str, mt: str, *, language: str,
+                         segments: List[Dict]) -> Path:
+        self.create_model_dir(model)
+        f = self.translation_file(model, mt)
+        f.write_text(json.dumps(
+            {"schema": SCHEMA, "model": model, "mt": mt, "language": language,
+             "created_at": _dt.datetime.now().isoformat(timespec="seconds"),
+             "segments": segments},
+            ensure_ascii=False, indent=2), "utf-8")
+        return f
 
     def save_transcript(self, model: str, *, language: str,
                         segments: List[Dict], model_repo: str = "",

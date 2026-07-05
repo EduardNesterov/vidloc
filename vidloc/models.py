@@ -69,6 +69,41 @@ class SubtitleStyle:
     outline_color: str = "#000000"  # outline colour (RGB hex)
 
 
+@dataclass
+class Caption:
+    """One on-screen subtitle line authored in the visual editor: text + timing +
+    a placement box, with optional per-line style overrides.
+
+    This is the *single source of truth* the editor produces: the pipeline burns it
+    into the picture **and** drives the TTS dubbing from the same list, so editing a
+    caption's text / timing directly changes both the subtitle and the voiceover.
+
+    ``rect`` is a normalized (x, y, w, h) in 0..1 (like :class:`TimedRegion`): the box
+    the user moves / resizes to place the text. Any style field left ``None`` falls
+    back to the job's global :class:`SubtitleStyle` default.
+    """
+    text: str
+    start: float
+    end: float
+    rect: tuple = (0.1, 0.78, 0.8, 0.14)  # default: lower band, centered
+    # -- optional per-caption style overrides (None → use global default) -------- #
+    font: Optional[str] = None
+    font_size_pct: Optional[float] = None  # if None, derive from box height
+    bold: Optional[bool] = None
+    primary_color: Optional[str] = None
+    outline_color: Optional[str] = None
+    outline_w: Optional[float] = None      # outline width in px (PlayRes); None → derive
+    uppercase: Optional[bool] = None
+    align: Optional[int] = None            # ASS numpad alignment (1..9); None → 5 (center)
+    # captions sharing a non-None ``group`` id were split from one sentence: they burn
+    # as separate short lines but the dub re-joins them into one utterance spanning the
+    # group, so splitting subtitles small does not chop the voiceover tempo.
+    group: Optional[int] = None
+
+    def active_at(self, t: float) -> bool:
+        return self.start <= t <= self.end
+
+
 class ASRQuality(str, Enum):
     FAST = "fast"
     BALANCED = "balanced"
@@ -251,14 +286,28 @@ class TranslateConfig:
     beam_size: int = 5
     # subtitles
     subtitle_placement: SubtitlePlacement = SubtitlePlacement.SOFT
-    subtitle_style: SubtitleStyle = field(default_factory=SubtitleStyle)
+    subtitle_style: SubtitleStyle = field(default_factory=SubtitleStyle)  # global default
     keep_source_subtitles: bool = False
+    # visual-editor captions: when non-empty they are the single source of truth for
+    # BOTH burned subtitles and dubbing (see vidloc/gui/subtitle_editor.py). Empty =
+    # fall back to the automatic ASR→translate→rechunk path (CLI / no editor).
+    captions: list = field(default_factory=list)  # list[Caption]
     # dubbing
     tts_engine: TTSEngine = TTSEngine.STYLETTS2_UK
     tts_voice: str = ""                       # voice id (see TTS_VOICES)
     tts_clone_reference: Optional[str] = None  # reserved for future cloning engines
-    keep_background: bool = False              # default: replace original audio (clean voiceover)
+    # Level of the ORIGINAL audio kept underneath the dub, 0..1 (a linear gain).
+    # 0.0 = replace the original entirely (clean voiceover, the default); e.g. 0.2 ducks
+    # the music/ambience low under the voice; 1.0 keeps it at full. This is the *relative*
+    # level vs. the dub, so it can be re-mixed onto a finished render without re-encoding
+    # (see ffmpeg.remix_audio). ``keep_background`` below derives from it for back-compat.
+    background_volume: float = 0.0
     tts_speed: float = 1.0                     # tempo nudge on top of per-line matching
+
+    @property
+    def keep_background(self) -> bool:
+        """True when any of the original audio should be mixed under the dub."""
+        return self.background_volume > 0.0
 
 
 @dataclass
@@ -273,6 +322,11 @@ class JobConfig:
 
     # convenience flags -------------------------------------------------- #
     @property
+    def has_captions(self) -> bool:
+        """True when the visual editor authored captions that drive subs + dub."""
+        return bool(self.translate.captions)
+
+    @property
     def needs_subtitles(self) -> bool:
         return self.translate.mode in (TranslateMode.SUBTITLES, TranslateMode.BOTH)
 
@@ -282,6 +336,10 @@ class JobConfig:
 
     @property
     def needs_asr(self) -> bool:
+        # Editor captions already carry the (translated) text + timing, so a run with
+        # captions skips the whole audio→ASR→translate front end.
+        if self.has_captions:
+            return False
         return self.needs_subtitles or self.needs_dubbing
 
     @property

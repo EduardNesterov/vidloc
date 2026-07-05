@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, List, Optional
 
 from .. import settings
@@ -139,9 +140,19 @@ def video_encoder_args(output=None, crf=None, codec=None) -> List[str]:
     return a
 
 
+def _duck_mix(bg_in: str, dub_in: str, out_label: str, bg_volume: float) -> str:
+    """Filtergraph that ducks the original audio to ``bg_volume`` (linear gain) and
+    mixes the dub on top at full level. ``normalize=0`` keeps the dub authoritative
+    (default amix would halve both inputs); a brick-wall limiter guards the sum from
+    clipping. ``bg_in`` / ``dub_in`` are input pad labels (e.g. ``"0:a"``)."""
+    return (f"[{bg_in}]volume={bg_volume:.3f}[bgv];"
+            f"[bgv][{dub_in}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            f"alimiter=limit=0.97[{out_label}]")
+
+
 def render_video(src: str, out: str, output: OutputConfig, *,
                  sub_path: Optional[str] = None, sub_burn: bool = False,
-                 dub_path: Optional[str] = None, keep_background: bool = True,
+                 dub_path: Optional[str] = None, bg_volume: float = 0.0,
                  src_has_audio: bool = True, duration: float = 0.0,
                  fontsdir: Optional[str] = None,
                  on_progress: ProgressCb = None, on_log: LogCb = None) -> None:
@@ -177,10 +188,9 @@ def render_video(src: str, out: str, output: OutputConfig, *,
     args: List[str] = list(inputs)
 
     # ---- audio: replace, duck-mix, or passthrough --------------------- #
-    use_complex = bool(dub_path) and keep_background and src_has_audio
+    use_complex = bool(dub_path) and bg_volume > 0.0 and src_has_audio
     if use_complex:
-        fc = (f"[0:a]volume=0.2[bg];"
-              f"[bg][{dub_idx}:a]amix=inputs=2:duration=first:dropout_transition=0[aout]")
+        fc = _duck_mix("0:a", f"{dub_idx}:a", "aout", bg_volume)
         if vfilter:
             fc = f"[0:v]{vfilter}[vout];" + fc
             args += ["-filter_complex", fc, "-map", "[vout]", "-map", "[aout]"]
@@ -230,3 +240,48 @@ def render_video(src: str, out: str, output: OutputConfig, *,
         Container.MP4, Container.MOV) else [out]
 
     run_ffmpeg(args, total_duration=duration, on_progress=on_progress, on_log=on_log)
+
+
+def remix_audio(video: str, out: str, *, dub_path: str, orig_src: str,
+                bg_volume: float, audio_bitrate: str = "192k",
+                container: Container = Container.MP4, duration: float = 0.0,
+                on_progress: ProgressCb = None, on_log: LogCb = None) -> None:
+    """Rebuild *only* the audio of an already-rendered ``video`` — no picture re-encode.
+
+    The video stream is stream-copied (``-c:v copy``) while the audio is rebuilt from the
+    two persisted stems: the original track (from ``orig_src``, ducked to ``bg_volume``)
+    and the dub (``dub_path``). This lets the user retune the original-under-dub level after
+    a full render in seconds, without paying for another video encode or another TTS pass.
+
+    Writes atomically (temp file → replace), so ``out`` may equal ``video`` (in-place retune).
+    """
+    mix_orig = bg_volume > 0.0
+    if mix_orig:
+        try:
+            mix_orig = probe(orig_src).has_audio
+        except Exception:  # noqa: BLE001 — no probe → treat as pure dub
+            mix_orig = False
+
+    inputs: List[str] = ["-i", video, "-i", dub_path]
+    dub_idx = 1
+    tail: List[str] = []
+    if mix_orig:
+        inputs += ["-i", orig_src]
+        tail += ["-filter_complex", _duck_mix("2:a", f"{dub_idx}:a", "aout", bg_volume),
+                 "-map", "0:v:0", "-map", "[aout]"]
+    else:                                   # pure dub — just swap the audio track in
+        tail += ["-map", "0:v:0", "-map", f"{dub_idx}:a:0"]
+    tail += ["-map", "0:s?", "-c:s", "copy"]  # keep any soft-subtitle track intact
+    acodec = "libopus" if container == Container.WEBM else "aac"
+    tail += ["-c:v", "copy", "-c:a", acodec, "-b:a", audio_bitrate]
+    if container in (Container.MP4, Container.MOV):
+        tail += ["-movflags", "+faststart"]
+
+    tmp = Path(out).with_name(f"{Path(out).stem}.remixtmp{Path(out).suffix}")
+    try:
+        run_ffmpeg(inputs + tail + [str(tmp)], total_duration=duration,
+                   on_progress=on_progress, on_log=on_log)
+        tmp.replace(out)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
